@@ -810,7 +810,7 @@ In the typeclass world, this is an **incoherence**: two call sites require
 incompatible instances of the same class. In the package world, it's a version
 conflict. The calculus detects it statically — no need to discover it at build time.
 
-**Resolution with backtracking** (§12.1 extension): a backtracking resolver
+**Resolution with backtracking** (§13.1 extension): a backtracking resolver
 could try `openssl@1.1` instead, but then `curl`'s constraint fails. The
 conflict is genuine — no solution exists under single-version coherence.
 
@@ -1208,9 +1208,282 @@ What GHC does NOT provide:
 - **Version range solving**: needs type-level encoding (Encoding B) or external tooling
 
 
-## §12 Open Questions and Extensions
+## §12 Superclass Context: Package Interfaces
 
-### 12.1 Backtracking
+In the GHC encodings of §11, constraints appear only on **instances** —
+each version of a package declares its own dependencies. But Haskell class
+declarations can also carry constraints — **superclass contexts**:
+
+```haskell
+class Eq a => Ord a where ...
+```
+
+This says: `Ord` *structurally requires* `Eq`. Not "this instance happens to
+need `Eq`" but "the concept of `Ord` is meaningless without `Eq`." Every
+`Ord` instance automatically has `Eq` available; every consumer of `Ord`
+automatically gets `Eq`.
+
+Applied to packages, the class declaration becomes a **package interface** —
+a specification of what the package provides and what it always requires,
+independent of any specific version. This is a level of abstraction that
+Nix currently lacks: in nixpkgs, the interface and the build recipe are
+conflated in the same `callPackage` expression.
+
+This section explores five uses of superclass context in the Encoding A
+(multi-class) style. Encoding C adaptations are noted where relevant.
+
+### 12.1 Automatic Constraint Propagation
+
+A superclass constraint is automatically available to any code that holds the
+subclass constraint. In package terms: if `HasOpenssl` has `HasZlib` as a
+superclass, then anything depending on openssl automatically gets zlib without
+listing it:
+
+```haskell
+-- Without superclass (all deps explicit):
+class HasZlib pkgs where
+  zlib :: Derivation
+
+class HasOpenssl pkgs where
+  openssl :: Derivation
+
+instance (HasOpenssl pkgs, HasZlib pkgs) => HasCurl pkgs where
+  curl = mkDrv "curl" [#openssl, #zlib]
+```
+
+```haskell
+-- With superclass (zlib propagated through openssl):
+class HasZlib pkgs where
+  zlib :: Derivation
+
+class HasZlib pkgs => HasOpenssl pkgs where
+  openssl :: Derivation
+
+instance HasOpenssl pkgs => HasCurl pkgs where
+  curl = mkDrv "curl" [#openssl, #zlib]
+  -- #zlib is available because HasOpenssl implies HasZlib
+```
+
+In the second version, `HasCurl` only lists `HasOpenssl` in its constraint,
+but `#zlib` works because GHC knows `HasOpenssl pkgs` entails `HasZlib pkgs`.
+
+This is **transitive dependency propagation**: the superclass chain
+`HasCurl => HasOpenssl => HasZlib` means that any consumer of `curl` can use
+`zlib` without explicitly depending on it. In Nix terms, this corresponds to
+`propagatedBuildInputs` — dependencies that are visible to downstream packages.
+
+### 12.2 Package Interface vs. Package Version
+
+The class declaration defines **what a package is**. The instance defines
+**how a specific version is built**. Separating these allows:
+
+```haskell
+-- The interface: openssl provides a library and headers, and always needs zlib.
+class HasZlib pkgs => HasOpenssl pkgs where
+  openssl        :: Derivation
+  opensslHeaders :: Path
+  opensslVersion :: Version
+
+-- Version 3.1:
+instance HasOpenssl Nixpkgs where
+  openssl = mkDrv "openssl" "3.1" [#zlib, #perl]
+  opensslHeaders = "/include/openssl"
+  opensslVersion = v 3 1 0
+
+-- Version 3.2 (different build recipe, same interface):
+instance HasOpenssl NixpkgsUnstable where
+  openssl = mkDrv "openssl" "3.2" [#zlib, #perl, #cmake]
+  opensslHeaders = "/include/openssl"
+  opensslVersion = v 3 2 0
+```
+
+The class enforces that **every version** of openssl provides `openssl`,
+`opensslHeaders`, and `opensslVersion`, and that `HasZlib` is always satisfied.
+Individual instances may have additional build-time dependencies (`perl`, `cmake`)
+that don't appear in the interface.
+
+This is the package-world analogue of **interface vs. implementation**: the class
+is the `.h` file, the instance is the `.c` file.
+
+**Multiple methods as multiple outputs.** A Nix derivation can produce multiple
+outputs (`out`, `dev`, `lib`, `doc`). In the class encoding, each output is a
+class method:
+
+```haskell
+class HasZlib pkgs => HasOpenssl pkgs where
+  opensslLib  :: Derivation    -- runtime library
+  opensslDev  :: Derivation    -- headers + pkg-config
+  opensslDoc  :: Derivation    -- man pages
+```
+
+Consumers pick which outputs they need: `opensslDev` for compilation,
+`opensslLib` for runtime, `opensslDoc` for documentation. Each is a separate
+thunk — unused outputs are never built (laziness).
+
+### 12.3 Virtual Packages and Package Groups
+
+A class with only superclasses and no methods is a **virtual package** — it
+provides nothing itself but demands that several packages are present:
+
+```haskell
+class (HasOpenssl pkgs, HasCurl pkgs, HasWget pkgs)
+  => HasNetworkStack pkgs
+
+-- No methods. The constraint IS the package.
+-- Any pkgs satisfying all three automatically satisfies the group.
+
+instance HasNetworkStack Nixpkgs
+  -- GHC checks that Nixpkgs has HasOpenssl, HasCurl, and HasWget.
+  -- If any is missing, compile-time error.
+```
+
+This maps to several real-world concepts:
+
+| Virtual package pattern | Example |
+|---|---|
+| Package group / meta-package | `build-essential` in Debian |
+| Feature set | `HasNetworkStack` bundles networking tools |
+| Platform constraint | `HasPosix` requires POSIX-compatible packages |
+| Test suite dependencies | `HasTestDeps` groups test frameworks |
+
+Virtual packages compose naturally through the superclass hierarchy:
+
+```haskell
+class (HasNetworkStack pkgs, HasCompiler pkgs, HasBuildTools pkgs)
+  => HasDevEnvironment pkgs
+```
+
+`HasDevEnvironment pkgs` in a constraint guarantees the full development
+environment is available, without listing dozens of individual packages.
+
+### 12.4 Propagated vs. Non-Propagated Dependencies
+
+In Nix, a package's dependencies fall into categories based on visibility:
+
+| Nix concept | Visibility | Superclass encoding |
+|---|---|---|
+| `propagatedBuildInputs` | Visible to downstream | Superclass context on class |
+| `buildInputs` | Visible at build time only | Constraint on instance |
+| `nativeBuildInputs` | Build-time, host-only tools | Constraint on instance |
+
+The class/instance split maps this precisely:
+
+```haskell
+-- Superclass: zlib is propagated (consumers of openssl see it in headers/linking)
+class HasZlib pkgs => HasOpenssl pkgs where
+  openssl :: Derivation
+
+-- Instance: perl and cmake are build-time only (not propagated)
+instance (HasPerl pkgs, HasCmake pkgs) => HasOpenssl pkgs where
+  openssl = mkDrv "openssl" [#zlib, #perl, #cmake]
+```
+
+A downstream package depending on openssl:
+
+```haskell
+instance HasOpenssl pkgs => HasCurl pkgs where
+  curl = mkDrv "curl" [#openssl, #zlib]
+  -- #zlib works: propagated via HasOpenssl's superclass
+  -- #perl would NOT work: it's only on the instance, not the class
+```
+
+This enforces a real invariant: build-time-only dependencies cannot leak into
+downstream packages. The type system prevents the mistake of accidentally using
+a build-time tool from a dependency — if it's not in the superclass chain, it's
+not in scope.
+
+### 12.5 Feature Flags as Class Hierarchy
+
+A package may come in several configurations. Each configuration is a separate
+class with its own superclass requirements:
+
+```haskell
+-- Base python — no optional features
+class HasZlib pkgs => HasPython pkgs where
+  python :: Derivation
+
+-- Python with SSL support
+class (HasPython pkgs, HasOpenssl pkgs) => HasPythonSSL pkgs where
+  pythonSSL :: Derivation
+
+-- Python with Tk GUI support
+class (HasPython pkgs, HasTk pkgs) => HasPythonTk pkgs where
+  pythonTk :: Derivation
+
+-- Python with everything
+class (HasPythonSSL pkgs, HasPythonTk pkgs) => HasPythonFull pkgs where
+  pythonFull :: Derivation
+```
+
+The hierarchy makes dependencies explicit:
+- `HasPythonSSL` requires `HasOpenssl` — you can't have SSL without openssl.
+- `HasPythonFull` requires both SSL and Tk — the full build needs everything.
+- A consumer can depend on exactly the configuration it needs.
+
+In Nix, feature flags are typically handled by function arguments
+(`python.override { sslSupport = true; }`). The class hierarchy makes these
+**statically checked**: if you depend on `HasPythonSSL`, GHC guarantees at
+compile time that openssl is available. No runtime "feature not enabled" errors.
+
+This also models **conditional dependencies** — the pattern where a package
+needs different deps depending on configuration. Each configuration is a
+different path through the class hierarchy.
+
+### 12.6 Encoding C Adaptation
+
+In Encoding C (single `Has` class with labels), superclass context is not
+directly available — there is only one class. Instead, the same effects
+can be achieved with **constraint synonyms** and **type families**:
+
+```haskell
+-- Constraint synonym for "openssl and its propagated deps":
+type NeedsOpenssl pkgs = (Has "openssl" pkgs, Has "zlib" pkgs)
+
+-- Or with ConstraintKinds and a type family:
+type family Propagated (name :: Symbol) pkgs :: Constraint
+type instance Propagated "openssl" pkgs = Has "zlib" pkgs
+type instance Propagated "curl" pkgs = (Has "openssl" pkgs, Has "zlib" pkgs)
+```
+
+This is less elegant than true superclass propagation — the constraint must
+be explicitly expanded at use sites or bundled into type synonyms. It is a
+trade-off: Encoding A's multi-class approach gives superclass context naturally,
+while Encoding C's single-class approach requires encoding it.
+
+A hybrid is possible: use Encoding C (`Has` class) for the uniform registry,
+but introduce additional multi-class interfaces for packages that need
+superclass propagation:
+
+```haskell
+-- Uniform registry:
+class Has (name :: Symbol) pkgs where ...
+
+-- Rich interface for packages that need it:
+class Has "zlib" pkgs => OpensslI pkgs where
+  opensslLib :: Derivation
+  opensslDev :: Derivation
+```
+
+### 12.7 Summary: What Superclass Context Buys
+
+| Feature | Without superclass | With superclass |
+|---|---|---|
+| Transitive deps | Listed explicitly everywhere | Propagated automatically |
+| Package interface | Implicit in build recipe | Explicit in class declaration |
+| Multiple outputs | Single derivation | Multiple class methods |
+| Virtual packages | Not expressible | Superclass-only classes |
+| Dep visibility | All deps are equal | Propagated vs. build-only |
+| Feature flags | Runtime/override | Static class hierarchy |
+| Correctness | Deps can be forgotten | Type checker enforces completeness |
+
+The superclass context turns the type checker into a **dependency auditor**:
+if a propagated dependency is missing, it is a compile-time error, not a
+runtime build failure.
+
+
+## §13 Open Questions and Extensions
+
+### 13.1 Backtracking
 
 The current calculus commits to `select`'s choice. If resolution of the
 selected declaration's dependencies fails, the whole resolution fails. An
@@ -1247,7 +1520,7 @@ Possible approaches:
 Approach (3) is essentially what SAT-based package managers do, but the second
 phase (lazy building) is what our calculus adds beyond them.
 
-### 12.2 Quantified Constraints
+### 13.2 Quantified Constraints
 
 Haskell's `QuantifiedConstraints` extension allows:
 
@@ -1265,7 +1538,7 @@ This requires extending constraints with universal quantification, moving us
 from Horn clauses to hereditary Harrop formulas. The resolution algorithm
 becomes significantly more complex (essentially λProlog).
 
-### 12.3 Semantic Versioning as Type Change
+### 13.3 Semantic Versioning as Type Change
 
 A breaking change (major version bump) corresponds to a change in the
 "evidence type" — the package now provides a different interface. A minor
@@ -1278,7 +1551,7 @@ with structural subtyping on evidence:
 -- major bump:   C_new is incompatible with C_old
 ```
 
-### 12.4 Build-Time Configuration as Associated Types
+### 13.4 Build-Time Configuration as Associated Types
 
 A package parameterized by build configuration (e.g., Python with/without SSL)
 corresponds to a typeclass with **associated types**:
@@ -1292,7 +1565,7 @@ class Package p where
 In our calculus, this could be modeled by indexing evidence by a configuration
 parameter, making constraints richer.
 
-### 12.5 Proof Search Strategies
+### 13.5 Proof Search Strategies
 
 The current calculus uses depth-first resolution (like GHC). Alternatives:
 - Breadth-first (complete but slower)
