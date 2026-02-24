@@ -23,9 +23,9 @@ ppEvidence = go 0
 
 -- | Pretty-print a constraint.
 ppConstraint :: Constraint -> String
-ppConstraint Trivial = "⊤"
+ppConstraint Trivial = "()"
 ppConstraint (Pkg name pred) = T.unpack name ++ ppVerPred pred
-ppConstraint (And c1 c2) = ppConstraint c1 ++ " ∧ " ++ ppConstraint c2
+ppConstraint (And c1 c2) = "(" ++ ppConstraint c1 ++ ", " ++ ppConstraint c2 ++ ")"
 
 ppVerPred :: VerPred -> String
 ppVerPred AnyVersion = "@*"
@@ -36,8 +36,8 @@ ppVerPred (Range lo hi) = "@[" ++ show lo ++ "," ++ show hi ++ ")"
 -- | Pretty-print a declaration.
 ppDecl :: Decl -> String
 ppDecl d =
-  "instance " ++ T.unpack (declPkg d) ++ "@" ++ show (declVer d)
-    ++ " given " ++ ppConstraint (declReqs d)
+  "instance " ++ ppConstraint (declReqs d) ++ " => "
+    ++ T.unpack (declPkg d) ++ "@" ++ show (declVer d)
 
 -- | Pretty-print the environment.
 ppEnv :: Env -> String

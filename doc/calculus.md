@@ -43,7 +43,7 @@ senses collapse into one in this calculus:
 
 2. **Logical derivation.** In proof theory, a *derivation* is a proof tree — a
    sequence of rule applications that establishes a conclusion from premises.
-   When we resolve `Pkg(python, ≥ 3.12)`, we build a derivation tree where each
+   When we resolve `python (>= 3.12)`, we build a derivation tree where each
    node is an application of an inference rule to its sub-derivations.
 
 3. **Haskell `deriving`.** The `deriving` keyword asks the compiler to
@@ -72,23 +72,33 @@ Versions         v ∈ (ℕ × ℕ × ℕ)     (major.minor.patch, totally order
 
 ### 2.2 Version Predicates
 
-```
-Predicate   π  ::=  = v               exact version
-                  |  ≥ v               at least v
-                  |  [v₁, v₂)          range (inclusive-exclusive)
-                  |  ⊤                 any version
+```haskell
+Predicate   π  ::=  (== v)            -- exact version
+                  |  (>= v)            -- at least v
+                  |  (>= v1, < v2)     -- range
+                  |  *                  -- any version
 ```
 
 Version satisfaction: `v ⊨ π` is defined in the obvious way.
 
 ### 2.3 Constraints (the "types" of the calculus)
 
-A constraint is a proposition asserting that certain packages are available:
+A constraint is a proposition asserting that certain packages are available.
+We use Haskell's typeclass constraint syntax:
 
+```haskell
+Constraint  C  ::=  p π               -- "package p at a version satisfying π"
+                 |  (C₁, C₂)          -- constraint tuple (conjunction)
+                 |  ()                 -- trivially satisfied (unit constraint)
 ```
-Constraint  C  ::=  Pkg(p, π)          "package p at a version satisfying π"
-                 |  C₁ ∧ C₂           conjunction
-                 |  ⊤                  trivially satisfied
+
+Examples, side by side with Haskell:
+
+```haskell
+-- Haskell                         -- Derix
+Eq a                               zlib (>= 1.0)
+(Eq a, Ord a)                      (openssl (>= 3.0), zlib (>= 1.0))
+()                                 ()
 ```
 
 Constraints are the **goals** of proof search. They correspond to typeclass
@@ -98,10 +108,10 @@ constraints like `(Eq a, Ord a) =>` in Haskell.
 
 Evidence witnesses that a constraint is satisfied:
 
-```
-Evidence    e  ::=  inst(p, v, ē)      "p@v, built with sub-evidence ē"
-                 |  (e₁, e₂)          conjunction evidence
-                 |  ★                  trivial evidence
+```haskell
+Evidence    e  ::=  inst(p, v, ē)    -- "p@v, built with sub-evidence ē"
+                 |  (e₁, e₂)         -- tuple evidence
+                 |  ()                -- trivial evidence
 ```
 
 where `ē = e₁, ..., eₙ` is a sequence of evidence terms.
@@ -115,31 +125,30 @@ and distinguishes our calculus from proof-irrelevant typeclass systems.
 
 An instance declaration introduces a new inference rule:
 
-```
-Declaration  d  ::=  instance p@v given C
+```haskell
+Declaration  d  ::=  instance C => p@v
+                  |  instance p@v          -- when C = ()
 ```
 
 Read: "Package `p` at version `v` is available, given that constraint `C` is
 satisfied." The constraint `C` captures the package's dependencies.
 
-This has the structure of a Haskell instance declaration:
+This IS Haskell's instance declaration syntax:
 
 ```haskell
+-- Haskell
 instance (Eq a, Show a) => Ord (MyType a) where ...
+
+-- Derix
+instance (eq (>= 1.0), show (>= 2.0)) => mytype@1.0
 ```
 
-corresponds to:
-
-```
-instance mytype@1.0 given Pkg(eq, ≥ 1.0) ∧ Pkg(show, ≥ 2.0)
-```
-
-The **context** (`given C`) corresponds to the premises above the inference rule
+The **context** (`C =>`) corresponds to the premises above the inference rule
 line. The **head** (`p@v`) corresponds to the conclusion. The declaration as a
 whole is a **dependent function** at the evidence level:
 
-```
-λ(e₁ : C₁). ... λ(eₙ : Cₙ). inst(p, v, e₁, ..., eₙ)
+```haskell
+\(e₁ :: C₁) ... (eₙ :: Cₙ) -> inst(p, v, e₁, ..., eₙ)
 ```
 
 This is the sense in which the context part "resembles lambda binding" — it binds
@@ -147,9 +156,9 @@ evidence variables that flow into the constructed evidence.
 
 ### 2.6 Instance Environment
 
-```
-Environment   Γ  ::=  ∅
-                    |  Γ, d              environment extended with declaration d
+```haskell
+Environment   Γ  ::=  []
+                    |  d : Γ           -- environment extended with declaration d
 ```
 
 An environment is a finite collection of instance declarations. It is the analogue
@@ -159,16 +168,16 @@ of:
 
 ### 2.7 Package Set (Resolved Evidence Record)
 
-```
+```haskell
 Package Set   Σ  ::=  { p₁ ↦ θ₁, ..., pₙ ↦ θₙ }
 ```
 
 where each `θᵢ` is a **thunk state**:
 
-```
-Thunk State   θ  ::=  ○(C)              unevaluated (suspended resolution of C)
-                    |  ●                 black hole (currently being forced)
-                    |  e                 evaluated (memoized evidence)
+```haskell
+Thunk State   θ  ::=  Thunk C           -- unevaluated (suspended resolution of C)
+                    |  BlackHole         -- currently being forced
+                    |  Value e           -- evaluated (memoized evidence)
 ```
 
 The package set is the analogue of:
@@ -180,7 +189,7 @@ The package set is the analogue of:
 
 Resolution is the central judgment of the calculus:
 
-```
+```haskell
 Γ; Σ ⊢ C ⇝ e
 ```
 
@@ -190,7 +199,7 @@ Read: "In environment Γ with package set Σ, constraint C resolves to evidence 
 
 ```
 ─────────────────── [TRIV]
-Γ; Σ ⊢ ⊤ ⇝ ★
+Γ; Σ ⊢ () ⇝ ()
 ```
 
 ### 3.2 Conjunction
@@ -198,21 +207,21 @@ Read: "In environment Γ with package set Σ, constraint C resolves to evidence 
 ```
 Γ; Σ ⊢ C₁ ⇝ e₁      Γ; Σ ⊢ C₂ ⇝ e₂
 ──────────────────────────────────────── [CONJ]
-Γ; Σ ⊢ C₁ ∧ C₂ ⇝ (e₁, e₂)
+Γ; Σ ⊢ (C₁, C₂) ⇝ (e₁, e₂)
 ```
 
 ### 3.3 Instance Resolution (the core rule)
 
 ```
-(instance p@v given C_req) ∈ Γ
+(instance C_req => p@v) ∈ Γ
 v ⊨ π
 select(Γ, p, π) = v                     (coherence: v is the selected version)
 Γ; Σ ⊢ C_req ⇝ ē
 ──────────────────────────────────────── [INST]
-Γ; Σ ⊢ Pkg(p, π) ⇝ inst(p, v, ē)
+Γ; Σ ⊢ p π ⇝ inst(p, v, ē)
 ```
 
-The rule says: to resolve `Pkg(p, π)`, find a declaration for `p` whose version
+The rule says: to resolve `p π`, find a declaration for `p` whose version
 satisfies `π`, recursively resolve its requirements, and construct evidence.
 
 The `select` function embodies the **coherence policy** — it determines which
@@ -224,20 +233,20 @@ When resolving within the context of a fixed-point package set, we can look up
 already-resolved (or in-progress) evidence:
 
 ```
-Σ(p) = e       (already forced and memoized)
-v(e) ⊨ π       (the memoized version satisfies the predicate)
+Σ(p) = Value e       (already forced and memoized)
+v(e) ⊨ π             (the memoized version satisfies the predicate)
 ──────────────────────────────────────── [LOOKUP]
-Γ; Σ ⊢ Pkg(p, π) ⇝ e
+Γ; Σ ⊢ p π ⇝ e
 ```
 
 ```
-Σ(p) = ○(C)    (not yet forced)
+Σ(p) = Thunk C       (not yet forced)
 ──────────────────────────────────────── [FORCE]
 force p in Σ, then apply [LOOKUP] or [INST]
 ```
 
 ```
-Σ(p) = ●       (black hole — currently being forced)
+Σ(p) = BlackHole     (currently being forced)
 ──────────────────────────────────────── [CYCLE]
 ERROR: cyclic dependency on p
 ```
@@ -253,8 +262,8 @@ the thunks it actually needs.
 
 The abstract machine state is a triple:
 
-```
-⟨Σ, F, C⟩
+```haskell
+(Σ, F, C)
 ```
 
 - `Σ` — the package set (mutable: thunks get updated to values)
@@ -266,37 +275,37 @@ The abstract machine state is a triple:
 **Force a thunk:**
 
 ```
-Σ(p) = ○(C_req)      p ∉ F
+Σ(p) = Thunk C_req      p ∉ F
 ────────────────────────────────────
-⟨Σ, F, Pkg(p, π)⟩
-  ⟶  Σ[p ↦ ●]                         (mark as black hole)
-      ⟨Σ[p ↦ ●], F ∪ {p}, C_req⟩      (resolve the requirement)
-      then  Σ[p ↦ e]                   (memoize result)
-      then  ⟨Σ[p ↦ e], F \ {p}, Pkg(p, π)⟩   (continue with [LOOKUP])
+(Σ, F, p π)
+  ⟶  Σ[p ↦ BlackHole]                     (mark as black hole)
+      (Σ[p ↦ BlackHole], F ∪ {p}, C_req)  (resolve the requirement)
+      then  Σ[p ↦ Value e]                 (memoize result)
+      then  (Σ[p ↦ Value e], F \ {p}, p π) (continue with [LOOKUP])
 ```
 
 **Black hole detection:**
 
 ```
-Σ(p) = ●    or    p ∈ F
+Σ(p) = BlackHole    or    p ∈ F
 ────────────────────────────────────
-⟨Σ, F, Pkg(p, π)⟩  ⟶  ERROR(cycle, p)
+(Σ, F, p π)  ⟶  ERROR(cycle, p)
 ```
 
 **Cache hit:**
 
 ```
-Σ(p) = e      v(e) ⊨ π
+Σ(p) = Value e      v(e) ⊨ π
 ────────────────────────────────────
-⟨Σ, F, Pkg(p, π)⟩  ⟶  e           (return memoized evidence)
+(Σ, F, p π)  ⟶  e               (return memoized evidence)
 ```
 
 **Conjunction (independent sub-goals):**
 
 ```
-⟨Σ, F, C₁ ∧ C₂⟩
-  ⟶  let e₁ = ⟨Σ, F, C₁⟩
-         e₂ = ⟨Σ, F, C₂⟩          (Σ may be updated by forcing in C₁)
+(Σ, F, (C₁, C₂))
+  ⟶  let e₁ = (Σ, F, C₁)
+         e₂ = (Σ, F, C₂)            (Σ may be updated by forcing in C₁)
      in  (e₁, e₂)
 ```
 
@@ -310,13 +319,13 @@ presentation is simpler and matches GHC's behavior.
 At all times, the package set `Σ` satisfies:
 
 > For each `p ∈ dom(Σ)`, exactly one of:
-> 1. `Σ(p) = ○(C)` — unevaluated (has never been demanded)
-> 2. `Σ(p) = ●` — currently being forced (appears in `F`)
-> 3. `Σ(p) = e` — fully resolved (will never change again)
+> 1. `Σ(p) = Thunk C` — unevaluated (has never been demanded)
+> 2. `Σ(p) = BlackHole` — currently being forced (appears in `F`)
+> 3. `Σ(p) = Value e` — fully resolved (will never change again)
 
 This is the **monotonicity** property: thunks can only transition
-`○ → ● → e`, never backwards. It ensures that the fixed point is
-well-defined and that sharing is sound.
+`Thunk → BlackHole → Value`, never backwards. It ensures that the fixed point
+is well-defined and that sharing is sound.
 
 
 ## §5 The Package Set as a Lazy Fixed Point
@@ -325,12 +334,12 @@ well-defined and that sharing is sound.
 
 Given an environment `Γ`, the **initial package set** is:
 
-```
-Σ₀ = { p ↦ ○(select_constraint(Γ, p)) | p ∈ pkgnames(Γ) }
+```haskell
+Σ₀ = Map.fromList [ (p, Thunk (constraint p)) | p <- pkgnames Γ ]
 ```
 
-where `select_constraint(Γ, p)` determines the constraint for `p` based on
-the selected declaration (see §7 for the selection policy).
+where `constraint p` determines the requirement for `p` based on the selected
+declaration (see §7 for the selection policy).
 
 Every entry is an unevaluated thunk. The package set is "complete" in the
 sense that it has an entry for every package name in the environment, but
@@ -340,8 +349,8 @@ no resolution has occurred yet.
 
 To obtain the evidence for package `p`, we force `Σ₀(p)`:
 
-```
-force(Σ₀, p) = ⟨Σ₀, ∅, Pkg(p, ⊤)⟩  ⟶*  e
+```haskell
+force Σ₀ p = (Σ₀, {}, p *) ⟶* e
 ```
 
 This triggers a chain of forcings — exactly the packages transitively
@@ -355,24 +364,25 @@ demand get resolved.
 
 The package set `Σ` is a fixed point of the function:
 
-```
-F(σ) = { p ↦ resolve(Γ, σ, select_constraint(Γ, p)) | p ∈ pkgnames(Γ) }
+```haskell
+f self = Map.fromList [ (p, resolve Γ self (constraint p)) | p <- pkgnames Γ ]
 ```
 
-Under call-by-need, `Σ = fix F` is computed incrementally:
+Under call-by-need, `Σ = fix f` is computed incrementally:
 - Start with `Σ₀ = ⊥` (all thunks)
 - Each forcing step computes one entry, potentially triggering others
 - By monotonicity (thunks only move forward), this converges
 - By the Kleene fixed-point theorem, the result is the least fixed point
 
-The domain-theoretic reading: `F` is a continuous function on the CPO of
-partial package sets (ordered by information content, with `○` < `●` < `e`).
-Laziness computes exactly the finite approximation you need.
+The domain-theoretic reading: `f` is a continuous function on the CPO of
+partial package sets (ordered by information content, with
+`Thunk < BlackHole < Value`). Laziness computes exactly the finite
+approximation you need.
 
 ### 5.4 Sharing
 
-Because thunks are memoized (`○ → e`, read thereafter), each package is
-resolved **at most once**. If both `curl` and `python` depend on `openssl`,
+Because thunks are memoized (`Thunk → Value`, read thereafter), each package
+is resolved **at most once**. If both `curl` and `python` depend on `openssl`,
 the second one to force `Σ(openssl)` gets the cached result. This is the
 call-by-need sharing guarantee.
 
@@ -387,46 +397,41 @@ across all call sites. Same mechanism, same reason.
 An **overlay** is a function that, given access to the final (post-overlay)
 and previous (pre-overlay) package sets, produces a set of replacement entries:
 
-```
-Overlay   O  ::=  λ(σ_final, σ_prev). Δ
+```haskell
+type Overlay = PkgSet -> PkgSet -> PkgSet
 
-where  Δ = { p₁ ↦ f₁(σ_final, σ_prev), ..., pₖ ↦ fₖ(σ_final, σ_prev) }
+-- Nix equivalent:  final: prev: { ... }
 ```
 
 This matches the Nix overlay signature `final: prev: { ... }`.
 
 ### 6.2 Application
 
-Applying overlay `O` to base set `Σ_base`:
+Applying overlay `o` to base set `base`:
 
+```haskell
+result = let final = Map.union (o final base) base
+         in  final
 ```
-Σ' = fix(σ ↦ Σ_base ⊕ O(σ, Σ_base))
-```
 
-where `⊕` is right-biased record merge (overlay entries shadow base entries).
+where `Map.union` is left-biased (overlay entries shadow base entries).
 
-The critical feature: `σ` (the self-reference, = `final`) sees the
-**post-overlay** world. So if the overlay replaces `openssl`, then every
-package that depends on `openssl` — even packages NOT mentioned in the
-overlay — automatically picks up the new version through the lazy fixed
-point. No explicit re-wiring needed.
+The critical feature: `final` (the self-reference) sees the **post-overlay**
+world. So if the overlay replaces `openssl`, then every package that depends
+on `openssl` — even packages NOT mentioned in the overlay — automatically
+picks up the new version through the lazy fixed point. No explicit re-wiring
+needed.
 
 ### 6.3 Overlay Composition
 
 Multiple overlays compose by chaining:
 
-```
-apply([], Σ_base)      = Σ_base
-apply([O], Σ_base)     = fix(σ ↦ Σ_base ⊕ O(σ, Σ_base))
-apply(O:Os, Σ_base)    = fix(σ ↦ apply(Os, Σ_base) ⊕ O(σ, apply(Os, Σ_base)))
-```
-
-Or equivalently, compose overlays into one:
-
-```
-compose([])      = λ(f, p). {}
-compose([O])     = O
-compose(O:Os)    = λ(f, p). let p' = p ⊕ compose(Os)(f, p) in p' ⊕ O(f, p')
+```haskell
+applyOverlays []       base = base
+applyOverlays (o : os) base =
+  let prev  = applyOverlays os base
+      final = Map.union (o final prev) prev
+  in  final
 ```
 
 ### 6.4 Overlay as Instance Replacement
@@ -434,8 +439,9 @@ compose(O:Os)    = λ(f, p). let p' = p ⊕ compose(Os)(f, p) in p' ⊕ O(f, p')
 In typeclass terms, an overlay corresponds to **replacing an instance
 declaration** in the environment:
 
-```
-Γ' = Γ[p@v_old ↦ p@v_new given C'_req]
+```haskell
+-- Before:  instance (zlib (>= 1.0)) => openssl@3.1
+-- After:   instance (zlib (>= 1.0)) => openssl@3.2
 ```
 
 and recomputing the fixed point. Haskell forbids this (instances are global
@@ -455,8 +461,8 @@ system. In a strict resolver, replacing `openssl` requires:
 This is an explicit, eager graph traversal. In our lazy calculus, none of
 this is needed. The overlay simply replaces the entry and re-ties the fixed
 point. Dependents are re-resolved *automatically* when forced, because they
-reference `σ(openssl)` (the self-reference), which now points to the new
-version. The propagation is implicit in the fixed-point semantics.
+reference `final ! "openssl"` (the self-reference), which now points to the
+new version. The propagation is implicit in the fixed-point semantics.
 
 This is the same reason GHC doesn't need to explicitly propagate dictionary
 changes — if a superclass instance changes, all subclass dictionaries that
@@ -467,14 +473,14 @@ reference it through the lazy record automatically pick up the new version.
 In Nix overlays, `prev` serves two distinct purposes:
 
 1. **Fallback**: Packages not mentioned in the overlay come from `prev`.
-   In `Σ_base ⊕ O(σ, Σ_base)`, the `⊕` merge provides this.
+   In `Map.union (o final prev) prev`, the union provides this.
 
 2. **Old value access**: The overlay can inspect what it's replacing.
    E.g., `prev.python.overrideAttrs (old: { ... })` modifies the old
    derivation rather than building from scratch.
 
-Our calculus captures (1) via the merge `⊕`. For (2), the overlay function
-receives `σ_prev` and can inspect its entries. In typeclass terms, this is
+Our calculus captures (1) via the union. For (2), the overlay function
+receives `prev` and can inspect its entries. In typeclass terms, this is
 like defining a new instance in terms of the old one — a form of instance
 inheritance that Haskell lacks but that is natural here.
 
@@ -506,19 +512,20 @@ Coherence holds trivially. This is the strictest policy.
 Multiple declarations may exist. `select` picks the one with the most
 specific (highest) version satisfying `π`:
 
-```
-select(Γ, p, π) = max { v | (instance p@v given _) ∈ Γ, v ⊨ π }
+```haskell
+select Γ p π = maximum [ v | (instance _ => p@v) <- Γ, v ⊨ π ]
 ```
 
 Coherence holds when this maximum is unique (no ties).
 
 **Policy 3: User-pinned**
 
-An explicit pinning `Pin : PkgName → Version` overrides selection:
+An explicit pinning `pin :: PkgName -> Maybe Version` overrides selection:
 
-```
-select(Γ, p, π) = Pin(p)   if defined and Pin(p) ⊨ π
-                  max{...}  otherwise
+```haskell
+select Γ p π = case pin p of
+  Just v | v ⊨ π -> v
+  _              -> maximum [ v | (instance _ => p@v) <- Γ, v ⊨ π ]
 ```
 
 This corresponds to explicit version pinning in lock files.
@@ -551,7 +558,7 @@ phase (Lean 4).
 
 **Theorem (Soundness).** If `Γ; Σ ⊢ C ⇝ e`, then `e` is well-formed
 evidence for `C`: for every sub-term `inst(p, v, ē)` in `e`, we have
-`(instance p@v given C_req) ∈ Γ` and `ē` is well-formed evidence for `C_req`.
+`(instance C_req => p@v) ∈ Γ` and `ē` is well-formed evidence for `C_req`.
 
 *Proof sketch.* By induction on the derivation of `Γ; Σ ⊢ C ⇝ e`. Each
 rule constructs evidence from sub-evidence by applying a declaration, and the
@@ -569,8 +576,7 @@ the derivation is forced. □
 ### 8.3 Termination of Resolution
 
 **Definition.** The **dependency graph** of `Γ` is the directed graph where
-`p → q` iff some declaration for `p` in `Γ` has `Pkg(q, _)` in its
-constraint.
+`p → q` iff some declaration for `p` in `Γ` has `q π` in its constraint.
 
 **Theorem (Termination).** If the dependency graph of `Γ` is acyclic, then
 resolution of any constraint `C` terminates.
@@ -587,21 +593,22 @@ long as the *resolution* of its *constraints* doesn't cycle.
 ### 8.4 Fixed-Point Existence
 
 **Theorem (Fixed-Point Existence).** If resolution terminates for all
-reachable constraints, then the package set `Σ = fix F` exists and is
+reachable constraints, then the package set `Σ = fix f` exists and is
 well-defined (as a value in the Scott domain of partial package sets).
 
-*Proof sketch.* The function `F(σ) = { p ↦ resolve(Γ, σ, ...) }` is
+*Proof sketch.* The function `f self = { p ↦ resolve Γ self ... }` is
 monotone on the domain of partial records (ordered by definedness). By the
-Kleene fixed-point theorem, `fix F = ⊔ₙ Fⁿ(⊥)` exists. Under call-by-need
+Kleene fixed-point theorem, `fix f = ⊔ₙ fⁿ(⊥)` exists. Under call-by-need
 evaluation, each `force` operation computes one step of this ascending chain.
 Termination of resolution ensures that forcing any entry reaches a value in
 finite steps. □
 
 ### 8.5 Overlay Monotonicity
 
-**Theorem (Overlay Stability).** If `O` only replaces declarations with
+**Theorem (Overlay Stability).** If `o` only replaces declarations with
 versions that satisfy all pre-existing constraints on the replaced package,
-then `fix(σ ↦ Σ_base ⊕ O(σ, Σ_base))` is well-defined whenever `Σ_base` is.
+then `let final = Map.union (o final base) base in final` is well-defined
+whenever `base` is.
 
 *Proof sketch.* The replacement preserves the termination conditions
 (dependency graph acyclicity is maintained if the new declaration has
@@ -615,21 +622,21 @@ then follows from §8.4. □
 
 **Environment:**
 
-```
-Γ = { instance zlib@1.3    given ⊤
-    , instance openssl@3.1  given Pkg(zlib, ≥ 1.0)
-    , instance curl@8.5     given Pkg(openssl, ≥ 3.0) ∧ Pkg(zlib, ≥ 1.0)
-    , instance python@3.12  given Pkg(openssl, ≥ 3.0) ∧ Pkg(zlib, ≥ 1.2)
-    }
+```haskell
+Γ = [ instance zlib@1.3
+    , instance (zlib (>= 1.0)) => openssl@3.1
+    , instance (openssl (>= 3.0), zlib (>= 1.0)) => curl@8.5
+    , instance (openssl (>= 3.0), zlib (>= 1.2)) => python@3.12
+    ]
 ```
 
 **Initial package set:**
 
-```
-Σ₀ = { zlib    ↦ ○(⊤)
-      , openssl ↦ ○(Pkg(zlib, ≥ 1.0))
-      , curl    ↦ ○(Pkg(openssl, ≥ 3.0) ∧ Pkg(zlib, ≥ 1.0))
-      , python  ↦ ○(Pkg(openssl, ≥ 3.0) ∧ Pkg(zlib, ≥ 1.2))
+```haskell
+Σ₀ = { zlib    ↦ Thunk ()
+      , openssl ↦ Thunk (zlib (>= 1.0))
+      , curl    ↦ Thunk (openssl (>= 3.0), zlib (>= 1.0))
+      , python  ↦ Thunk (openssl (>= 3.0), zlib (>= 1.2))
       }
 ```
 
@@ -637,48 +644,48 @@ then follows from §8.4. □
 
 ```
 Step 1:  force python
-         Σ₀(python) = ○(...)  →  mark ●
-         Σ₁ = { ..., python ↦ ● }
-         Goal: Pkg(openssl, ≥ 3.0) ∧ Pkg(zlib, ≥ 1.2)
+         Σ₀(python) = Thunk (...)  →  mark BlackHole
+         Σ₁ = { ..., python ↦ BlackHole }
+         Goal: (openssl (>= 3.0), zlib (>= 1.2))
 
-Step 2:  resolve Pkg(openssl, ≥ 3.0)
+Step 2:  resolve openssl (>= 3.0)
          force openssl
-         Σ₁(openssl) = ○(...)  →  mark ●
-         Σ₂ = { ..., openssl ↦ ●, python ↦ ● }
-         Goal: Pkg(zlib, ≥ 1.0)
+         Σ₁(openssl) = Thunk (...)  →  mark BlackHole
+         Σ₂ = { ..., openssl ↦ BlackHole, python ↦ BlackHole }
+         Goal: zlib (>= 1.0)
 
-Step 3:  resolve Pkg(zlib, ≥ 1.0)
+Step 3:  resolve zlib (>= 1.0)
          force zlib
-         Σ₂(zlib) = ○(⊤)  →  mark ●
-         Σ₃ = { zlib ↦ ●, openssl ↦ ●, python ↦ ● }
-         Goal: ⊤
-         Result: ★
-         Memoize: zlib ↦ inst(zlib, 1.3, ★)
-         Σ₄ = { zlib ↦ inst(zlib, 1.3, ★), openssl ↦ ●, python ↦ ● }
+         Σ₂(zlib) = Thunk ()  →  mark BlackHole
+         Σ₃ = { zlib ↦ BlackHole, openssl ↦ BlackHole, python ↦ BlackHole }
+         Goal: ()
+         Result: ()
+         Memoize: zlib ↦ Value (inst(zlib, 1.3, ()))
+         Σ₄ = { zlib ↦ Value (inst(zlib, 1.3, ())), openssl ↦ BlackHole, ... }
 
 Step 4:  back in openssl resolution
-         Evidence for zlib obtained: inst(zlib, 1.3, ★)
-         Memoize: openssl ↦ inst(openssl, 3.1, inst(zlib, 1.3, ★))
-         Σ₅ = { zlib ↦ inst(zlib, 1.3, ★)
-              , openssl ↦ inst(openssl, 3.1, inst(zlib, 1.3, ★))
-              , python ↦ ● }
+         Evidence for zlib obtained: inst(zlib, 1.3, ())
+         Memoize: openssl ↦ Value (inst(openssl, 3.1, inst(zlib, 1.3, ())))
+         Σ₅ = { zlib    ↦ Value (inst(zlib, 1.3, ()))
+              , openssl ↦ Value (inst(openssl, 3.1, inst(zlib, 1.3, ())))
+              , python  ↦ BlackHole }
 
 Step 5:  back in python resolution
          Evidence for openssl obtained.
-         Now resolve Pkg(zlib, ≥ 1.2):
-         force zlib  →  CACHE HIT (already inst(zlib, 1.3, ★))  ✓ sharing!
-         1.3 ⊨ ≥ 1.2  ✓
+         Now resolve zlib (>= 1.2):
+         force zlib  →  CACHE HIT (already Value ...)  ✓ sharing!
+         1.3 ⊨ (>= 1.2)  ✓
 
-Step 6:  Memoize: python ↦ inst(python, 3.12, inst(openssl, ...), inst(zlib, ...))
-         Σ₆ = { zlib    ↦ inst(zlib, 1.3, ★)
-              , openssl ↦ inst(openssl, 3.1, ...)
-              , curl    ↦ ○(...)                    ← never forced!
-              , python  ↦ inst(python, 3.12, ...) }
+Step 6:  Memoize: python ↦ Value (inst(python, 3.12, inst(openssl, ...), inst(zlib, ...)))
+         Σ₆ = { zlib    ↦ Value (inst(zlib, 1.3, ()))
+              , openssl ↦ Value (inst(openssl, 3.1, ...))
+              , curl    ↦ Thunk (...)                      ← never forced!
+              , python  ↦ Value (inst(python, 3.12, ...)) }
 ```
 
 **Key observations:**
 1. `zlib` was forced once, shared by both `openssl` and `python` (Step 5).
-2. `curl` was **never resolved** — its thunk remains `○`. This is laziness.
+2. `curl` was **never resolved** — its thunk remains `Thunk`. This is laziness.
 3. The resolution order was demand-driven: `python → openssl → zlib`, not
    topologically sorted in advance.
 
@@ -686,18 +693,18 @@ Step 6:  Memoize: python ↦ inst(python, 3.12, inst(openssl, ...), inst(zlib, .
 
 **Environment (pathological):**
 
-```
-Γ = { instance a@1.0  given Pkg(b, ≥ 1.0)
-    , instance b@1.0  given Pkg(a, ≥ 1.0)
-    }
+```haskell
+Γ = [ instance (b (>= 1.0)) => a@1.0
+    , instance (a (>= 1.0)) => b@1.0
+    ]
 ```
 
 **Resolving `a`:**
 
 ```
-Step 1:  force a  →  mark ●, goal: Pkg(b, ≥ 1.0)
-Step 2:  force b  →  mark ●, goal: Pkg(a, ≥ 1.0)
-Step 3:  force a  →  Σ(a) = ●  →  ERROR(cycle, a)
+Step 1:  force a  →  mark BlackHole, goal: b (>= 1.0)
+Step 2:  force b  →  mark BlackHole, goal: a (>= 1.0)
+Step 3:  force a  →  Σ(a) = BlackHole  →  ERROR(cycle, a)
 ```
 
 The black-hole mechanism catches the cycle. In Nix, this produces
@@ -707,23 +714,26 @@ The black-hole mechanism catches the cycle. In Nix, this produces
 
 Starting from the resolved set in §9.1, apply an overlay that bumps openssl:
 
-```
-O = λ(final, prev). { openssl ↦ inst(openssl, 3.2, final(zlib)) }
+```haskell
+overlay final prev = Map.fromList
+  [ ("openssl", inst(openssl, 3.2, final ! "zlib")) ]
 ```
 
 The new fixed point:
 
-```
-Σ' = fix(σ ↦ Σ₆ ⊕ O(σ, Σ₆))
-   = fix(σ ↦ { zlib    ↦ inst(zlib, 1.3, ★)            (from base)
-              , openssl ↦ inst(openssl, 3.2, σ(zlib))    (from overlay)
-              , curl    ↦ ○(...)                          (from base)
-              , python  ↦ ○(...)                          (from base, RE-THUNKED)
-              })
+```haskell
+result = let final = Map.union (overlay final Σ₆) Σ₆
+         in  final
+
+-- final = { zlib    ↦ inst(zlib, 1.3, ())              (from base)
+--         , openssl ↦ inst(openssl, 3.2, final ! "zlib") (from overlay)
+--         , curl    ↦ Thunk (...)                         (from base)
+--         , python  ↦ Thunk (...)                         (from base, RE-THUNKED)
+--         }
 ```
 
 Note: `python` must be re-thunked because it depends on `openssl`, which changed.
-When `python` is next forced, it will pick up `openssl@3.2` through `σ(openssl)`.
+When `python` is next forced, it will pick up `openssl@3.2` through `final ! "openssl"`.
 This happens automatically — no explicit re-wiring.
 
 In practice, the re-thunking granularity is a design choice: conservative
@@ -739,13 +749,13 @@ version.
 
 **Environment:**
 
-```
-Γ = { instance base@4.18   given ⊤
-    , instance text@2.0     given Pkg(base, ≥ 4.0)
-    , instance parsec@3.1   given Pkg(base, ≥ 4.0) ∧ Pkg(text, ≥ 1.0)
-    , instance aeson@2.2    given Pkg(base, ≥ 4.0) ∧ Pkg(text, ≥ 2.0)
-    , instance myapp@1.0    given Pkg(parsec, ≥ 3.0) ∧ Pkg(aeson, ≥ 2.0)
-    }
+```haskell
+Γ = [ instance base@4.18
+    , instance (base (>= 4.0)) => text@2.0
+    , instance (base (>= 4.0), text (>= 1.0)) => parsec@3.1
+    , instance (base (>= 4.0), text (>= 2.0)) => aeson@2.2
+    , instance (parsec (>= 3.0), aeson (>= 2.0)) => myapp@1.0
+    ]
 ```
 
 The diamond: `myapp → parsec → text` and `myapp → aeson → text`.
@@ -755,14 +765,14 @@ The diamond: `myapp → parsec → text` and `myapp → aeson → text`.
 ```
 force myapp
   → force parsec
-      → force base  →  inst(base, 4.18, ★)     [memoize]
+      → force base  →  inst(base, 4.18, ())           [memoize]
       → force text
-          → lookup base  →  CACHE HIT            [sharing]
-          →  inst(text, 2.0, inst(base, ...))    [memoize]
+          → lookup base  →  CACHE HIT                  [sharing]
+          →  inst(text, 2.0, inst(base, ...))          [memoize]
       →  inst(parsec, 3.1, inst(base, ...), inst(text, ...))  [memoize]
   → force aeson
-      → lookup base  →  CACHE HIT               [sharing]
-      → lookup text  →  CACHE HIT               [sharing!]
+      → lookup base  →  CACHE HIT                     [sharing]
+      → lookup text  →  CACHE HIT                     [sharing!]
       →  inst(aeson, 2.2, inst(base, ...), inst(text, ...))  [memoize]
   →  inst(myapp, 1.0, inst(parsec, ...), inst(aeson, ...))
 ```
@@ -778,23 +788,23 @@ is exactly the property that prevents diamond dependency conflicts.
 
 **Environment:**
 
-```
-Γ = { instance openssl@1.1  given ⊤
-    , instance openssl@3.1   given ⊤
-    , instance curl@8.0      given Pkg(openssl, ≥ 3.0)
-    , instance legacy@1.0    given Pkg(openssl, [1.0, 2.0))
-    , instance myapp@1.0     given Pkg(curl, ≥ 8.0) ∧ Pkg(legacy, ≥ 1.0)
-    }
+```haskell
+Γ = [ instance openssl@1.1
+    , instance openssl@3.1
+    , instance (openssl (>= 3.0)) => curl@8.0
+    , instance (openssl (>= 1.0, < 2.0)) => legacy@1.0
+    , instance (curl (>= 8.0), legacy (>= 1.0)) => myapp@1.0
+    ]
 ```
 
 Under the most-specific policy (`select` picks the highest matching version):
-- `curl` needs `openssl ≥ 3.0` → selects `openssl@3.1`
-- `legacy` needs `openssl ∈ [1.0, 2.0)` → selects `openssl@1.1`
+- `curl` needs `openssl (>= 3.0)` → selects `openssl@3.1`
+- `legacy` needs `openssl (>= 1.0, < 2.0)` → selects `openssl@1.1`
 - But coherence requires ONE version of `openssl` in `Σ`!
 
-Resolution fails because `select(Γ, openssl, ⊤)` picks `openssl@3.1` (highest),
-but then `legacy`'s constraint `Pkg(openssl, [1.0, 2.0))` is unsatisfied:
-`3.1 ⊭ [1.0, 2.0)`.
+Resolution fails because `select Γ "openssl" *` picks `openssl@3.1` (highest),
+but then `legacy`'s constraint `openssl (>= 1.0, < 2.0)` is unsatisfied:
+`3.1 ⊭ (>= 1.0, < 2.0)`.
 
 In the typeclass world, this is an **incoherence**: two call sites require
 incompatible instances of the same class. In the package world, it's a version
@@ -815,45 +825,41 @@ lazy fixed point.
 
 **Base environment** (from §9.1):
 
-```
-Σ_base = { zlib    ↦ inst(zlib, 1.3, ★)
-          , openssl ↦ inst(openssl, 3.1, inst(zlib, 1.3, ★))
-          , curl    ↦ inst(curl, 8.5, inst(openssl, ...), inst(zlib, ...))
-          , python  ↦ inst(python, 3.12, inst(openssl, ...), inst(zlib, ...))
-          }
+```haskell
+base = { zlib    ↦ inst(zlib, 1.3, ())
+       , openssl ↦ inst(openssl, 3.1, inst(zlib, 1.3, ()))
+       , curl    ↦ inst(curl, 8.5, inst(openssl, ...), inst(zlib, ...))
+       , python  ↦ inst(python, 3.12, inst(openssl, ...), inst(zlib, ...))
+       }
 ```
 
 (Assume all packages were forced in a prior session.)
 
 **Overlay**: replace `zlib` with a patched version:
 
-```
-O = λ(final, prev). { zlib ↦ inst(zlib, 1.3.1, ★) }
-```
-
-**New fixed point:**
-
-```
-Σ' = fix(σ ↦ Σ_base ⊕ O(σ, Σ_base))
+```haskell
+overlay final prev = Map.fromList
+  [ ("zlib", inst(zlib, 1.3.1, ())) ]
 ```
 
-Because the fixed point is re-tied, `σ(zlib)` now returns the patched `zlib@1.3.1`.
-Every package that transitively depends on `zlib` — `openssl`, `curl`, `python` —
-will see the new version when forced. The cascade is automatic:
+Because the fixed point is re-tied, `final ! "zlib"` now returns the patched
+`zlib@1.3.1`. Every package that transitively depends on `zlib` — `openssl`,
+`curl`, `python` — will see the new version when forced. The cascade is
+automatic:
 
 ```
-force python in Σ'
-  → resolve Pkg(openssl, ≥ 3.0)
-      → force openssl in Σ'
-          → resolve Pkg(zlib, ≥ 1.0)
-              → force zlib in Σ'  →  inst(zlib, 1.3.1, ★)  [new!]
-          →  inst(openssl, 3.1, inst(zlib, 1.3.1, ★))      [rebuilt with new zlib]
-  → resolve Pkg(zlib, ≥ 1.2)
-      → force zlib in Σ'  →  CACHE HIT: inst(zlib, 1.3.1, ★)
-  →  inst(python, 3.12, inst(openssl, ...), inst(zlib, 1.3.1, ★))
+force python in final
+  → resolve openssl (>= 3.0)
+      → force openssl in final
+          → resolve zlib (>= 1.0)
+              → force zlib in final  →  inst(zlib, 1.3.1, ())  [new!]
+          →  inst(openssl, 3.1, inst(zlib, 1.3.1, ()))         [rebuilt with new zlib]
+  → resolve zlib (>= 1.2)
+      → force zlib in final  →  CACHE HIT: inst(zlib, 1.3.1, ())
+  →  inst(python, 3.12, inst(openssl, ...), inst(zlib, 1.3.1, ()))
 ```
 
-One line in the overlay (`zlib ↦ ...`) caused `openssl`, `curl`, and `python`
+One line in the overlay (`"zlib" ↦ ...`) caused `openssl`, `curl`, and `python`
 to all pick up the patched zlib. This is the compositionality that the lazy
 fixed point provides.
 
@@ -889,9 +895,9 @@ Scala's implicit resolution allows **local scope** — different call sites may
 resolve the same typeclass differently. In our calculus, this corresponds to
 parameterizing the environment `Γ` per resolution context:
 
-```
-Γ_context₁; Σ₁ ⊢ Pkg(json, ≥ 1.0) ⇝ e₁    (resolves to json@2.0)
-Γ_context₂; Σ₂ ⊢ Pkg(json, ≥ 1.0) ⇝ e₂    (resolves to json@1.5)
+```haskell
+Γ₁; Σ₁ ⊢ json (>= 1.0) ⇝ e₁    -- resolves to json@2.0
+Γ₂; Σ₂ ⊢ json (>= 1.0) ⇝ e₂    -- resolves to json@1.5
 ```
 
 This models the "multiple versions coexist" scenario (like `node_modules`).
@@ -903,7 +909,7 @@ Rust enforces coherence via **orphan rules**: an impl of trait `T` for type `A`
 may only appear in the crate that defines `T` or the crate that defines `A`. In
 package terms:
 
-> A declaration `instance p@v given C` may only appear in the package that
+> A declaration `instance C => p@v` may only appear in the package that
 > defines the interface `C`'s class, or in package `p` itself.
 
 This prevents "action at a distance" — no third party can change how `p`
@@ -942,8 +948,8 @@ Scala's implicit search or DPLL's conflict-driven clause learning.
 | Tabled resolution | Prolog tabling (XSB) | Memoize failed branches | Preserved if deterministic |
 
 **Backtracking and laziness interact non-trivially.** In the current calculus,
-the package set `Σ` is monotone (thunks only move forward: `○ → ● → e`). With
-backtracking, a failed resolution might need to *undo* a memoized result and
+the package set `Σ` is monotone (thunks only move forward: `Thunk → BlackHole → Value`).
+With backtracking, a failed resolution might need to *undo* a memoized result and
 try a different version. This breaks monotonicity and complicates the fixed-point
 semantics.
 
@@ -972,8 +978,8 @@ instance (forall a. Eq a => Eq (f a)) => Eq (Compose f g a)
 
 In our calculus, this would be:
 
-```
-instance compose@1.0 given (∀ π. Pkg(inner, π) → Pkg(wrapper, π))
+```haskell
+instance (forall π. inner π => wrapper π) => compose@1.0
 ```
 
 This requires extending constraints with universal quantification, moving us
@@ -987,10 +993,10 @@ A breaking change (major version bump) corresponds to a change in the
 bump adds new evidence while preserving the old. This could be formalized
 with structural subtyping on evidence:
 
-```
-minor bump:   e_old : C_old   and   e_new : C_old ∧ C_extra
-patch bump:   same evidence type, different implementation
-major bump:   C_new is incompatible with C_old
+```haskell
+-- minor bump:   e_old :: C_old   and   e_new :: (C_old, C_extra)
+-- patch bump:   same evidence type, different implementation
+-- major bump:   C_new is incompatible with C_old
 ```
 
 ### 11.4 Build-Time Configuration as Associated Types

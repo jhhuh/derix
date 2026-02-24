@@ -65,9 +65,9 @@ buildPkgSet env =
 #### Example Output
 
 ```
-instance zlib@1.3.0 given ⊤
-instance openssl@3.1.0 given zlib@≥1.0.0
-instance python@3.12.0 given openssl@≥3.0.0 ∧ zlib@≥1.2.0
+instance () => zlib@1.3.0
+instance zlib@≥1.0.0 => openssl@3.1.0
+instance (openssl@≥3.0.0, zlib@≥1.2.0) => python@3.12.0
 
 Forcing python:
 python@3.12.0

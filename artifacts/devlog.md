@@ -90,3 +90,31 @@ The prototype runs all worked examples from the calculus doc:
 Favorites: **evince** (strongest semantics — the system evinces satisfiability),
 **derivo** (captures the triple pun), **knot** (captures the lazy fixed-point insight).
 No decision made yet — leaving it open.
+
+## 2026-02-25 — Named "derix", Haskell-like syntax, GHC piggybacking idea
+
+**Named "derix"**: After considering derivix, evince, derivo, entail, settled on
+**derix** — short, easy to type, captures derive + Nix.
+
+**Haskell-like syntax**: Rewrote `doc/calculus.md` and the Pretty printer to use
+Haskell-like notation throughout:
+- `instance C => p@v` instead of `instance p@v given C`
+- `(C₁, C₂)` instead of `C₁ ∧ C₂`
+- `()` instead of `⊤`
+- `Thunk C / BlackHole / Value e` instead of `○(C) / ● / e`
+
+**GHC piggybacking idea**: The user had previously thought about a language system
+that is "mere syntax sugar over Haskell" — Derix declarations would compile into
+actual GHC typeclass instances, and GHC's constraint solver would perform the
+resolution. This is the strongest validation of the thesis: if the two problems are
+truly isomorphic, you can literally use one as the other. The compilation would be:
+
+```
+-- Derix:   instance zlib@≥1.0 => openssl@3.1.0
+-- GHC:     instance (Resolve "zlib", AtLeast (Ver "zlib") '(1,0,0) ~ 'True)
+--            => Resolve "openssl" where type Ver "openssl" = '(3,1,0)
+```
+
+Tricky parts: version predicates need type-level comparison (type families),
+selection policies need OVERLAPPING pragmas or closed type families. But the
+basic architecture maps directly. This could be a concrete next milestone.
