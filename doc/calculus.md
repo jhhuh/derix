@@ -810,7 +810,7 @@ In the typeclass world, this is an **incoherence**: two call sites require
 incompatible instances of the same class. In the package world, it's a version
 conflict. The calculus detects it statically — no need to discover it at build time.
 
-**Resolution with backtracking** (§22.1 extension): a backtracking resolver
+**Resolution with backtracking** (§23.1 extension): a backtracking resolver
 could try `openssl@1.1` instead, but then `curl`'s constraint fails. The
 conflict is genuine — no solution exists under single-version coherence.
 
@@ -4314,11 +4314,248 @@ and verify. Together, they turn GHC's type system into a complete package
 resolution engine.
 
 
-## §22 Open Questions and Extensions
+## §22 GADTs: Type-Indexed Evidence
 
-### 22.1 Backtracking
+The calculus's evidence terms (`inst(p, v, e₁...eₙ)`, `(e₁, e₂)`, `★`) are
+untyped — nothing in their runtime representation says *which* constraint they
+prove. GADTs fix this: evidence becomes **type-indexed**, and construction is
+the only way to produce it.
 
-### 21.1 Backtracking
+### 22.1 Evidence as a GADT
+
+The core calculus evidence terms, encoded as a GADT:
+
+```haskell
+data Evidence (c :: Constraint) where
+  Star :: Evidence ()
+  Pair :: Evidence c1 -> Evidence c2 -> Evidence (c1, c2)
+  Inst :: (KnownSymbol name, KnownVersion ver)
+       => Proxy name -> Proxy ver
+       -> Evidence deps          -- sub-evidence for dependencies
+       -> Evidence (Has name ver)
+```
+
+The type index `c` records which constraint this evidence proves. You cannot
+construct `Evidence (Has "zlib" '(1,3,0))` without actually resolving zlib's
+dependencies — the type system enforces it.
+
+Pattern matching on `Evidence c` refines `c`, giving the caller access to
+the resolved name, version, and sub-evidence:
+
+```haskell
+inspect :: Evidence (Has "openssl" ver) -> (Evidence (Has "zlib" zver), ...)
+inspect (Inst _ _ deps) = ... -- 'ver' and dep evidence available
+```
+
+### 22.2 Existential Version Hiding
+
+The resolver picks a version, but consumers often don't care which:
+
+```haskell
+-- Exact: I know which version
+type Resolved name ver = Evidence (Has name ver)
+
+-- Existential: some version was resolved, I don't know which
+data SomeResolved (name :: Symbol) where
+  MkResolved :: KnownVersion ver
+             => Evidence (Has name ver)
+             -> SomeResolved name
+```
+
+`SomeResolved "zlib"` says "zlib was resolved" without committing to a
+version. This is the `∃v` quantifier — the resolver picks `v` existentially,
+and the consumer can only use operations that work for *any* version.
+
+The two levels correspond to different dependency styles:
+- **Exact** (`Resolved "zlib" '(1,3,0)`): lockfile entry, reproducible build
+- **Existential** (`SomeResolved "zlib"`): version-range dependency, flexible
+
+### 22.3 Version Predicate Witnesses
+
+A GADT that witnesses constraint satisfaction:
+
+```haskell
+data Satisfies (pred :: VerPred) (ver :: Version) where
+  SatExact   :: Satisfies ('Exact v) v
+  SatAtLeast :: (CmpVersion v lo ~ 'GT)
+             => Satisfies ('AtLeast lo) v
+  SatRange   :: (CmpVersion v lo ~ 'GT, CmpVersion v hi ~ 'LT)
+             => Satisfies ('Range lo hi) v
+  SatAny     :: Satisfies 'AnyVersion v
+```
+
+Pattern matching on `Satisfies pred ver` gives you the proof that `ver |= pred`.
+The resolver produces these witnesses; downstream code consumes them:
+
+```haskell
+resolve :: Env -> Constraint pred -> (SomeVersion ver, Satisfies pred ver)
+```
+
+The return type guarantees the resolved version actually satisfies the
+requested predicate — not by convention, but by construction.
+
+### 22.4 Heterogeneous Package Sets
+
+A package set as a type-indexed list:
+
+```haskell
+data PkgSet (manifest :: [(Symbol, Version)]) where
+  Empty :: PkgSet '[]
+  Add   :: Evidence (Has name ver)
+        -> PkgSet rest
+        -> PkgSet ('(name, ver) ': rest)
+```
+
+The type-level manifest tracks exactly which packages at which versions are
+present. You cannot add zlib@1.3 to a set whose manifest says zlib@1.2 —
+the types don't unify. This is §14's `Manifest` (DataKinds) made
+*constructive* — the GADT enforces the manifest by construction, not just
+declaration.
+
+Lookup is type-safe:
+
+```haskell
+type family HasEntry (name :: Symbol) (ver :: Version)
+              (manifest :: [(Symbol, Version)]) :: Constraint where
+  HasEntry n v ('(n, v) ': _)    = ()
+  HasEntry n v ('(_, _) ': rest) = HasEntry n v rest
+
+lookupPkg :: HasEntry name ver manifest
+          => PkgSet manifest -> Evidence (Has name ver)
+```
+
+### 22.5 Phase-Indexed Builds
+
+Build pipelines as a type-safe state machine:
+
+```haskell
+data Phase = Fetch | Configure | Build | Install | Done
+
+data BuildStep (before :: Phase) (after :: Phase) where
+  DoFetch     :: Sources    -> BuildStep 'Fetch     'Configure
+  DoConfigure :: ConfigOpts -> BuildStep 'Configure 'Build
+  DoBuild     :: BuildFlags -> BuildStep 'Build     'Install
+  DoInstall   :: InstallDir -> BuildStep 'Install   'Done
+```
+
+Steps compose only when phases match:
+
+```haskell
+andThen :: BuildStep a b -> BuildStep b c -> BuildPlan a c
+```
+
+You cannot install before building — `BuildStep 'Fetch 'Install` is
+uninhabited. The Nix build phases (`unpackPhase`, `configurePhase`,
+`buildPhase`, `installPhase`) become type-safe.
+
+### 22.6 Resolution Proof Trees
+
+The Curry-Howard payoff. Each constructor is an inference rule:
+
+```haskell
+data Proof (env :: [Decl]) (c :: Constraint) where
+  -- ⊤-intro
+  PTriv :: Proof env ()
+
+  -- ∧-intro
+  PPair :: Proof env c1 -> Proof env c2 -> Proof env (c1, c2)
+
+  -- Instance rule: if declaration d is in env,
+  -- and we can prove all of d's requirements,
+  -- then we can prove d's head
+  PInst :: Member d env              -- d ∈ Γ
+        -> Proofs env (DeclReqs d)   -- proofs for all dependencies
+        -> Proof env (Has (DeclPkg d) (DeclVer d))
+```
+
+This IS the derivation tree from §3's inference rules, but now the type
+system verifies that every step is valid. An ill-formed proof tree (wrong
+dependency, missing sub-proof, circular reasoning) is a *type error*.
+
+The triple pun completes: `Proof env c` is simultaneously a Nix derivation
+(build plan), a logical derivation (proof tree), and a Haskell deriving
+artifact (evidence) — and the GADT makes all three type-safe.
+
+### 22.7 Singleton Bridge
+
+GADTs connect type-level versions (DataKinds, §14) to runtime values:
+
+```haskell
+data SVersion (v :: Version) where
+  SVersion :: (KnownNat major, KnownNat minor, KnownNat patch)
+           => SVersion '(major, minor, patch)
+
+-- Runtime comparison using type-level knowledge
+compareSVersions :: SVersion v1 -> SVersion v2 -> Ordering
+compareSVersions (SVersion @m1 @n1 @p1) (SVersion @m2 @n2 @p2) =
+  compare (natVal @m1 Proxy, natVal @n1 Proxy, natVal @p1 Proxy)
+          (natVal @m2 Proxy, natVal @n2 Proxy, natVal @p2 Proxy)
+```
+
+The resolver operates at the type level (via type families, §21) but produces
+`SVersion` singletons when it needs to emit runtime build plans. The GADT
+guarantees the runtime value matches the type-level decision.
+
+### 22.8 Safe Version Coercions
+
+When two versions are compatible (same major version under semver), a GADT
+witnesses the safe substitution:
+
+```haskell
+data Compatible (v1 :: Version) (v2 :: Version) where
+  MkCompat :: (Major v1 ~ Major v2)
+           => Compatible v1 v2
+
+-- Safely substitute one version for another
+upgrade :: Compatible v1 v2
+        -> Evidence (Has name v1) -> Evidence (Has name v2)
+```
+
+Without the `Compatible` witness, version substitution is a type error.
+This makes the semver contract enforceable: a minor bump produces a
+`Compatible` witness, a major bump doesn't, and the type system ensures
+you don't mix them up.
+
+### 22.9 Scoped Environments
+
+GADTs can enforce that evidence is only used in the scope where it was
+resolved:
+
+```haskell
+data Scoped (env :: [Decl]) a where
+  InScope :: (AllResolved env => a) -> Scoped env a
+
+runScoped :: Proofs env (AllConstraints env) -> Scoped env a -> a
+```
+
+This prevents using evidence from one package set in another — the `env`
+index ties evidence to its resolution context. Combined with overlays (§6),
+this ensures that overridden packages use the *overlaid* evidence, not stale
+evidence from the base layer.
+
+### 22.10 Summary
+
+| GADT feature | Package management use |
+|---|---|
+| Type-indexed evidence (§22.1) | Proof that a specific package was resolved |
+| Existential hiding (§22.2) | Version-flexible dependencies (`∃v. Has p v`) |
+| Predicate witnesses (§22.3) | Proof that version satisfies constraint |
+| Heterogeneous sets (§22.4) | Manifest-correct package sets by construction |
+| Phase indexing (§22.5) | Type-safe build pipelines |
+| Proof trees (§22.6) | Type-checked derivation trees (Curry-Howard) |
+| Singletons (§22.7) | Type-level ↔ runtime version bridge |
+| Safe coercions (§22.8) | Semver-enforced version substitution |
+| Scoped environments (§22.9) | Evidence tied to its resolution context |
+
+GADTs are the **verification layer**. Everything in §14-§21 constructs
+type-level representations and computations. GADTs make those representations
+*trustworthy* — if you have a value of the right GADT type, the property
+holds by construction, not by convention.
+
+
+## §23 Open Questions and Extensions
+
+### 23.1 Backtracking
 
 The current calculus commits to `select`'s choice. If resolution of the
 selected declaration's dependencies fails, the whole resolution fails. An
@@ -4355,7 +4592,7 @@ Possible approaches:
 Approach (3) is essentially what SAT-based package managers do, but the second
 phase (lazy building) is what our calculus adds beyond them.
 
-### 22.2 Quantified Constraints
+### 23.2 Quantified Constraints
 
 Haskell's `QuantifiedConstraints` extension allows:
 
@@ -4373,7 +4610,7 @@ This requires extending constraints with universal quantification, moving us
 from Horn clauses to hereditary Harrop formulas. The resolution algorithm
 becomes significantly more complex (essentially λProlog).
 
-### 22.3 Semantic Versioning as Type Change
+### 23.3 Semantic Versioning as Type Change
 
 A breaking change (major version bump) corresponds to a change in the
 "evidence type" — the package now provides a different interface. A minor
@@ -4386,7 +4623,7 @@ with structural subtyping on evidence:
 -- major bump:   C_new is incompatible with C_old
 ```
 
-### 22.4 Build-Time Configuration as Associated Types
+### 23.4 Build-Time Configuration as Associated Types
 
 A package parameterized by build configuration (e.g., Python with/without SSL)
 corresponds to a typeclass with **associated types**:
@@ -4400,7 +4637,7 @@ class Package p where
 In our calculus, this could be modeled by indexing evidence by a configuration
 parameter, making constraints richer.
 
-### 22.5 Proof Search Strategies
+### 23.5 Proof Search Strategies
 
 The current calculus uses depth-first resolution (like GHC). Alternatives:
 - Breadth-first (complete but slower)
