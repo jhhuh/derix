@@ -810,7 +810,7 @@ In the typeclass world, this is an **incoherence**: two call sites require
 incompatible instances of the same class. In the package world, it's a version
 conflict. The calculus detects it statically — no need to discover it at build time.
 
-**Resolution with backtracking** (§13.1 extension): a backtracking resolver
+**Resolution with backtracking** (§14.1 extension): a backtracking resolver
 could try `openssl@1.1` instead, but then `curl`'s constraint fails. The
 conflict is genuine — no solution exists under single-version coherence.
 
@@ -1481,9 +1481,242 @@ if a propagated dependency is missing, it is a compile-time error, not a
 runtime build failure.
 
 
-## §13 Open Questions and Extensions
+## §13 Default Methods: Inherited Build Recipes
 
-### 13.1 Backtracking
+Haskell typeclasses can provide **default method implementations** in the class
+declaration. Instances inherit the default unless they override it:
+
+```haskell
+class Eq a where
+  (==) :: a -> a -> Bool
+  (/=) :: a -> a -> Bool
+  x /= y = not (x == y)    -- default: free for all instances
+```
+
+An `Eq` instance only needs to define `(==)` and gets `(/=)` automatically.
+Applied to packages, default methods become **default build recipes** — the
+class declaration says "here is the standard way to build this package" and
+specific package sets override only when they need something different.
+
+### 13.1 Default Build Recipes
+
+The class provides a default derivation. Instances get it for free:
+
+```haskell
+class HasZlib pkgs => HasOpenssl pkgs where
+  openssl :: Derivation
+  openssl = mkDrv "openssl" "3.1" [#zlib]
+
+  opensslHeaders :: Path
+  opensslHeaders = "/include/openssl"
+
+  opensslVersion :: Version
+  opensslVersion = v 3 1 0
+```
+
+A package set that satisfies `HasZlib` gets a working openssl without writing
+any instance body:
+
+```haskell
+data Nixpkgs
+instance HasZlib Nixpkgs where ...
+instance HasOpenssl Nixpkgs             -- uses all defaults
+```
+
+This is **`callPackage` as a language feature**. In Nix, `callPackage` inspects
+a function's arguments and fills them from the package set. Here, the default
+method body references superclass methods (`#zlib`), and GHC fills them from
+the instance's superclass dictionary. Same mechanism, made explicit.
+
+### 13.2 DefaultSignatures: Conditional Build Dependencies
+
+GHC's `DefaultSignatures` extension allows a default method to have a **more
+constrained type** than the class method:
+
+```haskell
+{-# LANGUAGE DefaultSignatures #-}
+
+class HasZlib pkgs => HasOpenssl pkgs where
+  openssl :: Derivation
+
+  default openssl :: HasPerl pkgs => Derivation
+  openssl = mkDrv "openssl" "3.1" [#zlib, #perl]
+```
+
+The class says: "openssl requires zlib (always)." The default says: "if you
+also have perl, here's a default build that uses it." This creates two tiers:
+
+```haskell
+-- Package set WITH perl: gets the default for free
+data Nixpkgs
+instance HasPerl Nixpkgs where ...
+instance HasOpenssl Nixpkgs             -- default kicks in, uses perl
+
+-- Package set WITHOUT perl: must provide explicit build
+data MinimalPkgs
+instance HasOpenssl MinimalPkgs where
+  openssl = mkDrv "openssl-lite" "3.1" [#zlib]   -- no perl, custom build
+```
+
+GHC enforces this at compile time. If `MinimalPkgs` lacks `HasPerl` and doesn't
+provide an explicit `openssl`, you get a type error — not a runtime build
+failure. The compiler tells you exactly which packages need manual builds in
+your configuration.
+
+This maps to Nix's concept of **optional dependencies**: perl is used for
+openssl's tests and some scripts, but you can build openssl without it if
+you provide an alternative recipe. The `DefaultSignatures` encoding makes
+this statically checked.
+
+### 13.3 Minimal Complete Definition
+
+Haskell's `{-# MINIMAL #-}` pragma specifies which methods an instance must
+define — everything else has usable defaults:
+
+```haskell
+class (HasZlib pkgs, HasPerl pkgs) => HasOpenssl pkgs where
+  opensslSrc     :: SourceTree       -- no default: must specify source
+  opensslVersion :: Version          -- no default: must specify version
+  opensslPatches :: [Patch]          -- default: no patches
+  opensslPatches = []
+  openssl        :: Derivation       -- default: standard build from src
+  openssl = standardBuild (opensslSrc @pkgs) (opensslPatches @pkgs)
+    [#zlib, #perl]
+  {-# MINIMAL opensslSrc, opensslVersion #-}
+```
+
+An instance must provide the source tree and version — these are per-version
+facts with no sensible default. Everything else (patches, build recipe) can
+be inherited. To bump openssl, you only change what actually changes:
+
+```haskell
+instance HasOpenssl Nixpkgs where
+  opensslSrc = fetchTarball "https://openssl.org/source/openssl-3.1.tar.gz"
+  opensslVersion = v 3 1 0
+  -- openssl and opensslPatches use defaults
+
+instance HasOpenssl NixpkgsUnstable where
+  opensslSrc = fetchTarball "https://openssl.org/source/openssl-3.2.tar.gz"
+  opensslVersion = v 3 2 0
+  opensslPatches = [cve_2024_1234]    -- override: this version needs a patch
+  -- openssl build recipe still uses default
+```
+
+This separates **what varies per version** (source, version, patches) from
+**what is stable across versions** (the build procedure). The `MINIMAL` pragma
+documents this split explicitly.
+
+### 13.4 Package Set Inheritance
+
+Default methods enable a form of **package set inheritance**: define a base
+set with all defaults, then derive variants by overriding only what changes.
+
+```haskell
+-- Base: standard package set, everything uses defaults
+data Nixpkgs
+instance HasZlib Nixpkgs where ...
+instance HasOpenssl Nixpkgs               -- default build
+instance HasCurl Nixpkgs                  -- default build
+instance HasPython Nixpkgs                -- default build
+
+-- Variant: security-hardened set, only overrides what changes
+data NixpkgsHardened
+instance HasZlib NixpkgsHardened where
+  zlib = zlib @Nixpkgs                    -- forward: unchanged
+
+instance HasOpenssl NixpkgsHardened where
+  openssl = mkDrv "openssl" "3.2"         -- override: bumped version
+    [#zlib, #perl]
+
+instance HasCurl NixpkgsHardened           -- default: auto-picks up new openssl
+instance HasPython NixpkgsHardened         -- default: auto-picks up new openssl
+```
+
+`HasCurl NixpkgsHardened` and `HasPython NixpkgsHardened` use the default
+build recipes. Those recipes reference `#openssl`, which resolves to
+`HasOpenssl NixpkgsHardened` — the overridden version. The cascade is
+automatic, driven by the `pkgs` type variable.
+
+This is a **typed overlay**: instead of Nix's `final: prev: { openssl = ...; }`,
+you write a new type with overridden instances. The compiler verifies that all
+dependencies are satisfied. Unlike Nix overlays, where a missing dependency is
+a runtime `attribute 'foo' missing` error, here it is a compile-time
+`No instance for HasFoo NixpkgsHardened`.
+
+### 13.5 Cross-Compilation as Instance Override
+
+The default method is the **native build**. Cross-compilation overrides the
+build recipe while preserving the package interface:
+
+```haskell
+class HasZlib pkgs => HasOpenssl pkgs where
+  openssl :: Derivation
+  openssl = nativeBuild "openssl" [#zlib]       -- default: native
+
+  opensslHeaders :: Path
+  opensslHeaders = "/include/openssl"            -- same for all targets
+```
+
+```haskell
+data CrossAarch64
+instance HasOpenssl CrossAarch64 where
+  openssl = crossBuild Aarch64 "openssl" [#zlib]  -- override: cross-compile
+  -- opensslHeaders uses default: headers are target-independent
+```
+
+Only the build step changes. The interface (headers path, version, etc.)
+remains the same. Consumers of `HasOpenssl pkgs` don't know or care whether
+they're using a native or cross-compiled openssl — the type is the same.
+
+This models Nix's `pkgsCross.aarch64-multiplatform` pattern, where
+cross-compiled package sets override build logic but preserve the attribute
+structure.
+
+### 13.6 Comparison with Nix Patterns
+
+| Default method concept | Nix equivalent |
+|---|---|
+| Default build recipe | `callPackage ./pkg.nix {}` (standard recipe) |
+| Instance override | `.override { ... }` / `.overrideAttrs` |
+| `DefaultSignatures` | Optional deps (`configureFlags = lib.optional ...`) |
+| `{-# MINIMAL #-}` | Which args `callPackage` requires vs. has defaults for |
+| Package set inheritance | Overlays (`final: prev: { ... }`) |
+| Cross-compilation override | `pkgsCross` attribute sets |
+
+The key difference: in Nix, all of these are dynamic (checked at evaluation
+time). With default methods, they are **static** (checked at compile time).
+A missing dependency, an incomplete override, or a broken cross-compilation
+recipe is caught by the type checker before any package is built.
+
+### 13.7 Encoding C Adaptation
+
+In Encoding C (single `Has` class), default methods cannot vary per package —
+there is only one class with one set of methods. However, the same effect can
+be achieved by layering a **default instance** atop the base class:
+
+```haskell
+-- Base class: no default
+class Has (name :: Symbol) pkgs where
+  dep :: Derivation
+
+-- Default recipes as a separate class:
+class HasDefault (name :: Symbol) pkgs where
+  defaultDep :: Derivation
+
+-- Fallback: if HasDefault exists, use it
+instance {-# OVERLAPPABLE #-} HasDefault name pkgs => Has name pkgs where
+  dep = defaultDep @name @pkgs
+```
+
+Package-specific overrides use `{-# OVERLAPPING #-}` to shadow the default.
+This works but sacrifices the clean coherence story — overlapping instances
+are the Encoding C cost of defaults. Encoding A handles this naturally through
+per-class default methods.
+
+
+## §14 Open Questions and Extensions
+
+### 14.1 Backtracking
 
 The current calculus commits to `select`'s choice. If resolution of the
 selected declaration's dependencies fails, the whole resolution fails. An
@@ -1520,7 +1753,7 @@ Possible approaches:
 Approach (3) is essentially what SAT-based package managers do, but the second
 phase (lazy building) is what our calculus adds beyond them.
 
-### 13.2 Quantified Constraints
+### 14.2 Quantified Constraints
 
 Haskell's `QuantifiedConstraints` extension allows:
 
@@ -1538,7 +1771,7 @@ This requires extending constraints with universal quantification, moving us
 from Horn clauses to hereditary Harrop formulas. The resolution algorithm
 becomes significantly more complex (essentially λProlog).
 
-### 13.3 Semantic Versioning as Type Change
+### 14.3 Semantic Versioning as Type Change
 
 A breaking change (major version bump) corresponds to a change in the
 "evidence type" — the package now provides a different interface. A minor
@@ -1551,7 +1784,7 @@ with structural subtyping on evidence:
 -- major bump:   C_new is incompatible with C_old
 ```
 
-### 13.4 Build-Time Configuration as Associated Types
+### 14.4 Build-Time Configuration as Associated Types
 
 A package parameterized by build configuration (e.g., Python with/without SSL)
 corresponds to a typeclass with **associated types**:
@@ -1565,7 +1798,7 @@ class Package p where
 In our calculus, this could be modeled by indexing evidence by a configuration
 parameter, making constraints richer.
 
-### 13.5 Proof Search Strategies
+### 14.5 Proof Search Strategies
 
 The current calculus uses depth-first resolution (like GHC). Alternatives:
 - Breadth-first (complete but slower)
