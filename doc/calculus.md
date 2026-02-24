@@ -810,7 +810,7 @@ In the typeclass world, this is an **incoherence**: two call sites require
 incompatible instances of the same class. In the package world, it's a version
 conflict. The calculus detects it statically — no need to discover it at build time.
 
-**Resolution with backtracking** (§20.1 extension): a backtracking resolver
+**Resolution with backtracking** (§21.1 extension): a backtracking resolver
 could try `openssl@1.1` instead, but then `curl`'s constraint fails. The
 conflict is genuine — no solution exists under single-version coherence.
 
@@ -3598,9 +3598,336 @@ for properties. This mirrors how real systems work — module systems handle
 the coarse structure, type systems handle the fine invariants.
 
 
-## §20 Open Questions and Extensions
+## §20 ConstraintKinds: Dependencies as First-Class Types
 
-### 20.1 Backtracking
+GHC's `ConstraintKinds` extension promotes `Constraint` from a special
+syntactic category to a first-class kind. Constraints become types that can
+be:
+
+- **Aliased** with `type` synonyms
+- **Computed** by type families
+- **Passed** as type parameters
+- **Stored** in data types (via GADTs)
+- **Composed** with type-level operations
+
+Since constraints ARE dependencies in our encoding, `ConstraintKinds` makes
+**dependency sets into first-class type-level data** — you can name them,
+compute them, transform them, and reify them.
+
+```haskell
+{-# LANGUAGE ConstraintKinds #-}
+import Data.Kind (Constraint)
+```
+
+### 20.1 Dependency Group Aliases
+
+The simplest use: name a recurring set of dependencies:
+
+```haskell
+type NetworkDeps pkgs =
+  (HasOpenssl pkgs, HasCurl pkgs, HasWget pkgs, HasZlib pkgs)
+
+type BuildEssentials pkgs =
+  (HasGcc pkgs, HasMake pkgs, HasBinutils pkgs, HasPkgConfig pkgs)
+
+type PythonDevDeps pkgs =
+  (HasPython pkgs, HasPip pkgs, HasSetuptools pkgs, HasWheel pkgs)
+```
+
+Used in instance declarations:
+
+```haskell
+instance (NetworkDeps pkgs, BuildEssentials pkgs) => HasWget pkgs where
+  wget = mkDrv "wget" "1.21" [#openssl, #curl, #zlib, #gcc, #make]
+```
+
+And in function signatures:
+
+```haskell
+buildWebServer :: NetworkDeps pkgs => Derivation
+deployApp :: (NetworkDeps pkgs, PythonDevDeps pkgs) => IO ()
+```
+
+This is **dependency abstraction**: instead of listing 10 individual
+constraints everywhere, name the pattern once. Change the group definition,
+and all uses update automatically.
+
+Without `ConstraintKinds`, these aliases are not fully first-class — you
+cannot pass them to type families or use them as type parameters. With
+`ConstraintKinds`, they are just types of kind `* -> Constraint`.
+
+### 20.2 Computed Dependencies
+
+Type families can return `Constraint`, enabling dependency sets that are
+**computed** from configuration:
+
+**Platform-conditional dependencies:**
+
+```haskell
+type family PlatformDeps (p :: Platform) pkgs :: Constraint where
+  PlatformDeps 'X86_64Linux  pkgs = (HasSystemd pkgs, HasInotify pkgs, HasAlsa pkgs)
+  PlatformDeps 'Aarch64Linux pkgs = (HasSystemd pkgs, HasInotify pkgs)
+  PlatformDeps 'X86_64Darwin pkgs = (HasLaunchd pkgs, HasFsevents pkgs, HasCoreAudio pkgs)
+  PlatformDeps 'Wasm32       pkgs = ()
+
+instance (HasStdenv pkgs, PlatformDeps (HostPlatform pkgs) pkgs)
+  => HasMyApp pkgs where ...
+```
+
+The dependency set changes based on the target platform — at compile time.
+On Linux, `HasMyApp` requires systemd and inotify. On WASM, no platform
+deps at all. The type checker ensures each platform's dependencies are met.
+
+**Feature-flag-conditional dependencies:**
+
+```haskell
+type family FeatureDeps (features :: [Symbol]) pkgs :: Constraint where
+  FeatureDeps '[]            pkgs = ()
+  FeatureDeps ("ssl" ': fs)  pkgs = (HasOpenssl pkgs, FeatureDeps fs pkgs)
+  FeatureDeps ("gui" ': fs)  pkgs = (HasGtk pkgs, HasCairo pkgs, FeatureDeps fs pkgs)
+  FeatureDeps ("db"  ': fs)  pkgs = (HasSqlite pkgs, FeatureDeps fs pkgs)
+  FeatureDeps (_     ': fs)  pkgs = FeatureDeps fs pkgs
+
+type PythonFeatures = '["ssl", "db"]
+
+instance FeatureDeps PythonFeatures pkgs => HasPython pkgs where ...
+```
+
+Change the feature list, and the dependency set recomputes. Add `"gui"` and
+the type checker demands `HasGtk` and `HasCairo`.
+
+### 20.3 The `DepsOf` Pattern
+
+A single type family that maps every package name to its constraint set:
+
+```haskell
+type family DepsOf (name :: Symbol) pkgs :: Constraint where
+  DepsOf "zlib"    pkgs = ()
+  DepsOf "openssl" pkgs = Has "zlib" pkgs
+  DepsOf "curl"    pkgs = (Has "openssl" pkgs, Has "zlib" pkgs)
+  DepsOf "python"  pkgs = (Has "openssl" pkgs, Has "zlib" pkgs, Has "readline" pkgs)
+  DepsOf "wget"    pkgs = (Has "openssl" pkgs, Has "curl" pkgs, Has "zlib" pkgs)
+```
+
+This is a **dependency database as a type family**. Now `Has` can use it:
+
+```haskell
+class DepsOf name pkgs => Has (name :: Symbol) pkgs where
+  dep :: Derivation
+```
+
+The constraint `DepsOf name pkgs` is automatically required for every `Has`
+instance. The dependency database is defined once (in `DepsOf`) and
+enforced everywhere (through the superclass).
+
+**Generic resolution:**
+
+```haskell
+-- "Resolve this package given its deps are met":
+resolve :: (Has name pkgs, DepsOf name pkgs) => Proxy name -> Derivation
+resolve = dep
+```
+
+The `DepsOf` pattern centralizes the dependency graph in one place,
+separate from the build recipes. Change a dependency, and all affected
+packages must be updated — enforced by the type checker.
+
+### 20.4 Constraint Algebra
+
+With constraints as types, you can build an algebra over dependency sets:
+
+**Union** — needs everything from both:
+
+```haskell
+class (a pkgs, b pkgs) => Union a b pkgs
+instance (a pkgs, b pkgs) => Union a b pkgs
+
+type DevDeps = Union BuildEssentials PythonDevDeps
+-- DevDeps pkgs = (HasGcc pkgs, HasMake pkgs, ..., HasPython pkgs, HasPip pkgs, ...)
+```
+
+**Implies** — one dependency set entails another (with `QuantifiedConstraints`):
+
+```haskell
+type Implies a b = forall pkgs. a pkgs => b pkgs
+
+-- NetworkDeps implies HasOpenssl:
+type NetworkHasSSL = Implies NetworkDeps HasOpenssl
+```
+
+**Weaken** — drop a dependency from a set:
+
+```haskell
+-- Not directly expressible as type family subtraction,
+-- but achievable by defining a new alias without the dropped dep:
+type NetworkDepsNoWget pkgs = (HasOpenssl pkgs, HasCurl pkgs, HasZlib pkgs)
+```
+
+**Conditional** — choose a dependency set based on a flag:
+
+```haskell
+type family Choose (b :: Bool) (a :: * -> Constraint) (b' :: * -> Constraint)
+    :: * -> Constraint where
+  Choose 'True  a _ = a
+  Choose 'False _ b = b
+
+type SSLDeps = Choose UseLibreSSL HasLibressl HasOpenssl
+```
+
+### 20.5 Dict: Reified Dependencies
+
+The `Dict` GADT captures a constraint as a runtime value:
+
+```haskell
+data Dict (c :: Constraint) where
+  Dict :: c => Dict c
+```
+
+In the package world, `Dict` reifies the question "does this package set
+have package X?" into a runtime-inspectable value:
+
+```haskell
+-- Check whether openssl is available:
+hasOpenssl :: forall pkgs. Maybe (Dict (HasOpenssl pkgs))
+
+-- A package manifest as a list of reified constraints:
+type Manifest pkgs =
+  [ ("zlib",    Dict (HasZlib pkgs))
+  , ("openssl", Dict (HasOpenssl pkgs))
+  , ("curl",    Dict (HasCurl pkgs))
+  ]
+```
+
+**Runtime dependency resolution.** Instead of compile-time resolution only,
+`Dict` enables a hybrid model:
+
+```haskell
+-- Try to resolve at compile time; fall back to runtime check:
+buildOptionalSSL :: Maybe (Dict (HasOpenssl pkgs)) -> Derivation
+buildOptionalSSL (Just Dict) = mkDrv "myapp" [#openssl]   -- with SSL
+buildOptionalSSL Nothing     = mkDrv "myapp-no-ssl" []     -- without
+```
+
+**Constraint entailment at runtime:**
+
+```haskell
+-- Given NetworkDeps, produce evidence of HasOpenssl:
+networkHasSSL :: Dict (NetworkDeps pkgs) -> Dict (HasOpenssl pkgs)
+networkHasSSL Dict = Dict    -- HasOpenssl is part of NetworkDeps
+```
+
+This is a **runtime proof** that one dependency set entails another. The
+function is total — it always succeeds because the entailment holds by
+definition. The type system guarantees it.
+
+### 20.6 Constraint-Parameterized Builders
+
+Build patterns (§17.2) can be parameterized by their dependency constraint:
+
+```haskell
+class Builder (deps :: * -> Constraint) where
+  buildWith :: deps pkgs => SourceTree -> [Dep pkgs] -> Derivation
+
+-- CMake builder requires cmake + ninja + gcc:
+instance Builder CMakeBuildDeps where
+  buildWith src extras =
+    cmake src >> ninja >> install
+
+-- Autotools builder requires make + gcc:
+instance Builder AutotoolsBuildDeps where
+  buildWith src extras =
+    configure src >> make >> makeInstall
+```
+
+Now a package declares which builder it uses **by its dependency constraint**:
+
+```haskell
+type instance BuilderFor "openssl" = CMakeBuildDeps
+type instance BuilderFor "zlib"    = AutotoolsBuildDeps
+
+-- Generic build:
+buildPkg :: (Builder (BuilderFor name), BuilderFor name pkgs)
+         => Proxy name -> Derivation
+buildPkg name = buildWith @(BuilderFor name) (srcOf name) (depsOf name)
+```
+
+The builder is selected by the constraint type. Wrong builder for wrong
+package is a type error — you can't use the autotools builder for a cmake
+project because the constraint doesn't match.
+
+### 20.7 The Constraint Store Pattern
+
+A package set can be represented as a **constraint store** — a type-level
+map from names to constraints:
+
+```haskell
+type family Lookup (name :: Symbol) (store :: [(Symbol, * -> Constraint)])
+    :: * -> Constraint where
+  Lookup name ('(name, c) ': _)    = c
+  Lookup name (_          ': rest) = Lookup name rest
+
+type MyStore =
+  '[ '("zlib",    HasZlib)
+   , '("openssl", HasOpenssl)
+   , '("curl",    HasCurl)
+   ]
+
+-- Extract a specific constraint:
+type ZlibConstraint = Lookup "zlib" MyStore    -- HasZlib
+```
+
+**Package set operations as store operations:**
+
+```haskell
+-- Add a package to the store:
+type Add name c store = '(name, c) ': store
+
+-- Remove a package (filter):
+type family Remove (name :: Symbol) (store :: [(Symbol, * -> Constraint)])
+    :: [(Symbol, * -> Constraint)] where
+  Remove name ('(name, _) ': rest) = rest
+  Remove name (entry      ': rest) = entry ': Remove name rest
+  Remove name '[] = '[]
+
+-- Merge two stores (overlay):
+type family Merge (overlay :: [(Symbol, * -> Constraint)])
+                  (base :: [(Symbol, * -> Constraint)])
+    :: [(Symbol, * -> Constraint)] where
+  Merge '[]              base = base
+  Merge ('(n, c) ': rest) base = '(n, c) ': Merge rest (Remove n base)
+```
+
+This is a **type-level package set** where the entries are constraints.
+Overlays are `Merge` operations. The entire dependency graph exists at the
+type level and can be manipulated before any runtime code executes.
+
+### 20.8 Summary
+
+| ConstraintKinds use | What it enables |
+|---|---|
+| Dependency aliases (§20.1) | Name recurring dependency patterns |
+| Computed deps (§20.2) | Platform/feature-conditional dependencies |
+| `DepsOf` pattern (§20.3) | Centralized dependency database |
+| Constraint algebra (§20.4) | Union, implication, conditional selection |
+| Dict reification (§20.5) | Runtime dependency checking + evidence |
+| Parameterized builders (§20.6) | Builder selected by constraint type |
+| Constraint store (§20.7) | Type-level package set with full algebra |
+
+The common thread: without `ConstraintKinds`, dependencies are syntactic
+artifacts — they appear in instance contexts and cannot be manipulated.
+With `ConstraintKinds`, dependencies become **type-level data**: named,
+computed, stored, composed, reified. The dependency graph itself becomes
+a type-level structure that the compiler can reason about.
+
+This is the foundation that makes §16.5 (associated constraints), §18
+(quantified constraints), and the `DepsOf` centralized dependency pattern
+possible. It is, in a sense, the extension that turns Haskell's constraint
+system from a proof checker into a **dependency management system**.
+
+
+## §21 Open Questions and Extensions
+
+### 21.1 Backtracking
 
 The current calculus commits to `select`'s choice. If resolution of the
 selected declaration's dependencies fails, the whole resolution fails. An
@@ -3637,7 +3964,7 @@ Possible approaches:
 Approach (3) is essentially what SAT-based package managers do, but the second
 phase (lazy building) is what our calculus adds beyond them.
 
-### 20.2 Quantified Constraints
+### 21.2 Quantified Constraints
 
 Haskell's `QuantifiedConstraints` extension allows:
 
@@ -3655,7 +3982,7 @@ This requires extending constraints with universal quantification, moving us
 from Horn clauses to hereditary Harrop formulas. The resolution algorithm
 becomes significantly more complex (essentially λProlog).
 
-### 20.3 Semantic Versioning as Type Change
+### 21.3 Semantic Versioning as Type Change
 
 A breaking change (major version bump) corresponds to a change in the
 "evidence type" — the package now provides a different interface. A minor
@@ -3668,7 +3995,7 @@ with structural subtyping on evidence:
 -- major bump:   C_new is incompatible with C_old
 ```
 
-### 20.4 Build-Time Configuration as Associated Types
+### 21.4 Build-Time Configuration as Associated Types
 
 A package parameterized by build configuration (e.g., Python with/without SSL)
 corresponds to a typeclass with **associated types**:
@@ -3682,7 +4009,7 @@ class Package p where
 In our calculus, this could be modeled by indexing evidence by a configuration
 parameter, making constraints richer.
 
-### 20.5 Proof Search Strategies
+### 21.5 Proof Search Strategies
 
 The current calculus uses depth-first resolution (like GHC). Alternatives:
 - Breadth-first (complete but slower)
