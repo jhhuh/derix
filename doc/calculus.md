@@ -810,7 +810,7 @@ In the typeclass world, this is an **incoherence**: two call sites require
 incompatible instances of the same class. In the package world, it's a version
 conflict. The calculus detects it statically — no need to discover it at build time.
 
-**Resolution with backtracking** (§14.1 extension): a backtracking resolver
+**Resolution with backtracking** (§15.1 extension): a backtracking resolver
 could try `openssl@1.1` instead, but then `curl`'s constraint fails. The
 conflict is genuine — no solution exists under single-version coherence.
 
@@ -1714,9 +1714,365 @@ are the Encoding C cost of defaults. Encoding A handles this naturally through
 per-class default methods.
 
 
-## §14 Open Questions and Extensions
+## §14 DataKinds: Type-Level Package Management
 
-### 14.1 Backtracking
+GHC's `DataKinds` extension promotes data constructors to types and type
+constructors to kinds. This lifts package management concepts — names,
+versions, predicates, dependency graphs, overlays — into the type level,
+where GHC's type checker enforces correctness statically.
+
+Throughout this section, we assume:
+
+```haskell
+{-# LANGUAGE DataKinds, TypeFamilies, TypeOperators,
+             UndecidableInstances, PolyKinds #-}
+
+import GHC.TypeLits (Symbol, Nat, CmpNat, TypeError, ErrorMessage(..))
+```
+
+### 14.1 Type-Level Versions
+
+Versions are promoted triples of `Nat`:
+
+```haskell
+-- At the value level:
+data Version = V Nat Nat Nat
+
+-- DataKinds promotes this to the kind level:
+-- kind Version, with promoted constructor 'V :: Nat -> Nat -> Nat -> Version
+```
+
+Type-level version comparison via closed type families:
+
+```haskell
+type family CmpVersion (a :: Version) (b :: Version) :: Ordering where
+  CmpVersion ('V a1 a2 a3) ('V b1 b2 b3) =
+    CmpField (CmpNat a1 b1) a2 a3 b2 b3
+
+type family CmpField (o :: Ordering) a2 a3 b2 b3 :: Ordering where
+  CmpField 'LT _ _ _ _ = 'LT
+  CmpField 'GT _ _ _ _ = 'GT
+  CmpField 'EQ a2 a3 b2 b3 = CmpField2 (CmpNat a2 b2) a3 b3
+
+type family CmpField2 (o :: Ordering) a3 b3 :: Ordering where
+  CmpField2 'LT _ _ = 'LT
+  CmpField2 'GT _ _ = 'GT
+  CmpField2 'EQ a3 b3 = CmpNat a3 b3
+```
+
+Now version comparison is computed at compile time:
+
+```haskell
+-- These are type-level truths, checked by GHC:
+type Check1 = CmpVersion ('V 3 1 0) ('V 1 0 0) ~ 'GT   -- 3.1.0 > 1.0.0
+type Check2 = CmpVersion ('V 1 3 0) ('V 1 3 0) ~ 'EQ   -- reflexivity
+```
+
+### 14.2 Type-Level Version Predicates
+
+Version predicates become promoted types, with satisfaction checked by a
+type family:
+
+```haskell
+data VerPred
+  = Exact Version
+  | AtLeast Version
+  | Range Version Version      -- [lo, hi)
+  | Any
+
+type family Satisfies (v :: Version) (p :: VerPred) :: Bool where
+  Satisfies v ('Exact v)        = 'True
+  Satisfies v ('Exact _)        = 'False
+  Satisfies v ('AtLeast lo)     = CmpVersion v lo /= 'LT
+  Satisfies v ('Range lo hi)    = CmpVersion v lo /= 'LT
+                                  && CmpVersion v hi == 'LT
+  Satisfies v 'Any              = 'True
+```
+
+A constraint that a version satisfies a predicate:
+
+```haskell
+type Requires v p = Satisfies v p ~ 'True
+```
+
+Used in instance declarations:
+
+```haskell
+class Has (name :: Symbol) pkgs where
+  type Ver name pkgs :: Version
+  dep :: Derivation
+
+instance Has "zlib" pkgs where
+  type Ver "zlib" pkgs = 'V 1 3 0
+  dep = mkDrv "zlib" "1.3" []
+
+instance ( Has "zlib" pkgs
+         , Requires (Ver "zlib" pkgs) ('AtLeast ('V 1 0 0))
+         ) => Has "openssl" pkgs where
+  type Ver "openssl" pkgs = 'V 3 1 0
+  dep = mkDrv "openssl" "3.1" [#zlib]
+```
+
+If the package set provides `zlib@0.9`, the constraint `Requires (Ver "zlib"
+pkgs) ('AtLeast ('V 1 0 0))` reduces to `'False ~ 'True` — a compile-time
+type error. The version predicate is checked before any code runs.
+
+**Custom type errors** make the failure readable:
+
+```haskell
+type family Requires (v :: Version) (p :: VerPred) :: Constraint where
+  Requires v p =
+    If (Satisfies v p)
+      (() :: Constraint)
+      (TypeError ('Text "Version " ':<>: 'ShowType v
+                  ':<>: 'Text " does not satisfy " ':<>: 'ShowType p))
+```
+
+GHC reports: `Version 'V 0 9 0 does not satisfy AtLeast ('V 1 0 0)`.
+
+### 14.3 Type-Level Package Set Descriptors
+
+Instead of bare phantom types (`data Nixpkgs`), package sets can carry a
+**type-level manifest** — a promoted list describing their contents:
+
+```haskell
+data PkgEntry = PkgE Symbol Version
+
+-- The manifest: a type-level list of (name, version) pairs
+type NixpkgsManifest =
+  '[ 'PkgE "zlib"    ('V 1 3 0)
+   , 'PkgE "openssl" ('V 3 1 0)
+   , 'PkgE "curl"    ('V 8 5 0)
+   , 'PkgE "python"  ('V 3 12 0)
+   ]
+
+-- A package set tagged with its manifest:
+data PkgSet (manifest :: [PkgEntry])
+
+type Nixpkgs = PkgSet NixpkgsManifest
+```
+
+Type-level lookup:
+
+```haskell
+type family LookupVer (name :: Symbol) (m :: [PkgEntry]) :: Version where
+  LookupVer name ('PkgE name ver ': _)  = ver
+  LookupVer name (_             ': rest) = LookupVer name rest
+  LookupVer name '[] =
+    TypeError ('Text "Package " ':<>: 'ShowType name ':<>: 'Text " not found")
+```
+
+This enables **static completeness checking**: if code demands a package not
+in the manifest, GHC reports the missing package at compile time. No runtime
+"attribute missing" errors.
+
+**Package set comparison** becomes a type-level operation:
+
+```haskell
+-- Type-level diff: which packages changed between two manifests?
+type family Diff (m1 :: [PkgEntry]) (m2 :: [PkgEntry]) :: [PkgEntry] where
+  Diff '[] _ = '[]
+  Diff ('PkgE name ver ': rest) m2 =
+    If (LookupVer name m2 == ver)
+      (Diff rest m2)                                   -- same: skip
+      ('PkgE name ver ': Diff rest m2)                 -- changed: include
+```
+
+### 14.4 Type-Level Dependency Graphs
+
+The dependency structure can be promoted to a type-level graph:
+
+```haskell
+data DepEdge = Edge Symbol Symbol    -- Edge "curl" "openssl" = curl depends on openssl
+
+type ExampleGraph =
+  '[ 'Edge "openssl" "zlib"
+   , 'Edge "curl" "openssl"
+   , 'Edge "curl" "zlib"
+   , 'Edge "python" "openssl"
+   , 'Edge "python" "zlib"
+   ]
+```
+
+**Static cycle detection** via type-level DFS:
+
+```haskell
+type family HasCycle (graph :: [DepEdge]) :: Bool where
+  HasCycle graph = HasCycleFrom graph (AllNodes graph) '[]
+
+type family HasCycleFrom (graph :: [DepEdge]) (nodes :: [Symbol])
+                         (visited :: [Symbol]) :: Bool where
+  HasCycleFrom _     '[]          _       = 'False
+  HasCycleFrom graph (n ': rest) visited =
+    DetectFrom graph n '[] visited || HasCycleFrom graph rest visited
+
+type family DetectFrom (graph :: [DepEdge]) (node :: Symbol)
+                       (path :: [Symbol]) (visited :: [Symbol]) :: Bool where
+  DetectFrom graph node path visited =
+    If (Elem node path)
+      'True                                              -- cycle!
+      (If (Elem node visited)
+        'False                                           -- already checked
+        (CheckSuccessors graph (Successors graph node) (node ': path) visited))
+```
+
+Assert acyclicity as a constraint:
+
+```haskell
+type Acyclic graph = HasCycle graph ~ 'False
+```
+
+A package environment with a cycle fails at compile time:
+
+```haskell
+type CyclicGraph = '[ 'Edge "a" "b", 'Edge "b" "a" ]
+-- type NoCycle = Acyclic CyclicGraph
+-- GHC error: 'True ~ 'False (could be improved with TypeError)
+```
+
+**Transitive dependency computation:**
+
+```haskell
+type family TransDeps (name :: Symbol) (graph :: [DepEdge]) :: [Symbol] where
+  TransDeps name graph = TransDepsGo graph (Successors graph name) '[] '[]
+
+type family Successors (graph :: [DepEdge]) (name :: Symbol) :: [Symbol] where
+  Successors '[] _ = '[]
+  Successors ('Edge name dep ': rest) name = dep ': Successors rest name
+  Successors (_ ': rest) name = Successors rest name
+```
+
+This enables type-level queries like "what are all transitive dependencies of
+curl?" — answered at compile time.
+
+### 14.5 Type-Level Overlay Composition
+
+Overlays can be tracked as type-level tags, with GHC ensuring correct
+composition:
+
+```haskell
+data Overlay = OL Symbol [Symbol]     -- overlay name + packages it modifies
+
+type BumpOpenssl = 'OL "bump-openssl" '["openssl"]
+type PatchZlib   = 'OL "patch-zlib"   '["zlib"]
+
+-- Package set parameterized by base manifest and applied overlays:
+data PkgSet (base :: [PkgEntry]) (overlays :: [Overlay])
+```
+
+**Prevent duplicate overlays:**
+
+```haskell
+type family NotApplied (o :: Overlay) (os :: [Overlay]) :: Constraint where
+  NotApplied o '[] = ()
+  NotApplied ('OL name _) ('OL name _ ': _) =
+    TypeError ('Text "Overlay " ':<>: 'ShowType name ':<>: 'Text " already applied")
+  NotApplied o (_ ': rest) = NotApplied o rest
+```
+
+**Apply an overlay with type-level tracking:**
+
+```haskell
+type family ApplyOverlay (o :: Overlay) (m :: [PkgEntry]) :: [PkgEntry]
+
+type instance ApplyOverlay ('OL "bump-openssl" _) m =
+  SetVer "openssl" ('V 3 2 0) m
+
+type family SetVer (name :: Symbol) (ver :: Version)
+                   (m :: [PkgEntry]) :: [PkgEntry] where
+  SetVer name ver ('PkgE name _ ': rest) = 'PkgE name ver ': rest
+  SetVer name ver (entry       ': rest)  = entry ': SetVer name ver rest
+```
+
+**Track overlay provenance in the type:**
+
+```haskell
+type Nixpkgs = PkgSet NixpkgsManifest '[]
+
+type NixpkgsPatched = PkgSet
+  (ApplyOverlay BumpOpenssl NixpkgsManifest)
+  '[BumpOpenssl]
+
+type NixpkgsFullyPatched = PkgSet
+  (ApplyOverlay PatchZlib (ApplyOverlay BumpOpenssl NixpkgsManifest))
+  '[PatchZlib, BumpOpenssl]
+```
+
+The type of the package set records exactly which overlays have been applied
+and in what order. A function requiring a specific overlay can state this in
+its constraint:
+
+```haskell
+-- This function requires the openssl bump to have been applied:
+type family HasOverlay (name :: Symbol) (os :: [Overlay]) :: Constraint where
+  HasOverlay name ('OL name _ ': _)  = ()
+  HasOverlay name (_ ': rest)        = HasOverlay name rest
+  HasOverlay name '[] =
+    TypeError ('Text "Required overlay " ':<>: 'ShowType name
+              ':<>: 'Text " not applied")
+
+buildSecureServer :: HasOverlay "bump-openssl" overlays
+                  => PkgSet manifest overlays -> Derivation
+```
+
+### 14.6 Putting It Together
+
+Combining all five features, a fully type-level package declaration looks like:
+
+```haskell
+-- The manifest declares what exists and at what versions:
+type MyManifest =
+  '[ 'PkgE "zlib"    ('V 1 3 0)
+   , 'PkgE "openssl" ('V 3 1 0)
+   , 'PkgE "curl"    ('V 8 5 0)
+   ]
+
+-- The dependency graph declares the structure:
+type MyGraph =
+  '[ 'Edge "openssl" "zlib"
+   , 'Edge "curl" "openssl"
+   , 'Edge "curl" "zlib"
+   ]
+
+-- The package set, with static guarantees:
+type MyPkgs = PkgSet MyManifest '[]
+
+-- At compile time, GHC verifies:
+type CheckMyPkgs =
+  ( Acyclic MyGraph                                        -- no cycles
+  , Requires (LookupVer "zlib" MyManifest) 'Any            -- zlib exists
+  , Requires (LookupVer "zlib" MyManifest)                 -- openssl's dep
+      ('AtLeast ('V 1 0 0))                                --   is satisfied
+  )
+```
+
+Every check is performed by the type checker. A malformed package set —
+missing dependency, version conflict, cyclic graph, duplicate overlay — is
+a **compile-time type error**, not a runtime failure.
+
+### 14.7 Trade-offs
+
+| Benefit | Cost |
+|---|---|
+| Version predicates checked at compile time | Complex type family machinery |
+| Missing packages caught statically | Slow type checking on large sets |
+| Cycle detection before evaluation | `UndecidableInstances` required |
+| Overlay provenance tracked in types | Verbose type signatures |
+| Package set diffing and comparison | GHC error messages can be opaque |
+
+The type-level approach is most valuable for **critical infrastructure** where
+catching errors early justifies the complexity. For rapid prototyping or small
+package sets, the simpler encodings of §11 may be preferable.
+
+`DataKinds` does not replace the runtime fixed-point construction (§5) — it
+adds a **static verification layer** on top. The runtime still uses lazy
+thunks for sharing and demand-driven evaluation. The type level ensures that
+the runtime will not encounter version mismatches or missing packages.
+
+
+## §15 Open Questions and Extensions
+
+### 15.1 Backtracking
 
 The current calculus commits to `select`'s choice. If resolution of the
 selected declaration's dependencies fails, the whole resolution fails. An
@@ -1753,7 +2109,7 @@ Possible approaches:
 Approach (3) is essentially what SAT-based package managers do, but the second
 phase (lazy building) is what our calculus adds beyond them.
 
-### 14.2 Quantified Constraints
+### 15.2 Quantified Constraints
 
 Haskell's `QuantifiedConstraints` extension allows:
 
@@ -1771,7 +2127,7 @@ This requires extending constraints with universal quantification, moving us
 from Horn clauses to hereditary Harrop formulas. The resolution algorithm
 becomes significantly more complex (essentially λProlog).
 
-### 14.3 Semantic Versioning as Type Change
+### 15.3 Semantic Versioning as Type Change
 
 A breaking change (major version bump) corresponds to a change in the
 "evidence type" — the package now provides a different interface. A minor
@@ -1784,7 +2140,7 @@ with structural subtyping on evidence:
 -- major bump:   C_new is incompatible with C_old
 ```
 
-### 14.4 Build-Time Configuration as Associated Types
+### 15.4 Build-Time Configuration as Associated Types
 
 A package parameterized by build configuration (e.g., Python with/without SSL)
 corresponds to a typeclass with **associated types**:
@@ -1798,7 +2154,7 @@ class Package p where
 In our calculus, this could be modeled by indexing evidence by a configuration
 parameter, making constraints richer.
 
-### 14.5 Proof Search Strategies
+### 15.5 Proof Search Strategies
 
 The current calculus uses depth-first resolution (like GHC). Alternatives:
 - Breadth-first (complete but slower)
