@@ -810,7 +810,7 @@ In the typeclass world, this is an **incoherence**: two call sites require
 incompatible instances of the same class. In the package world, it's a version
 conflict. The calculus detects it statically — no need to discover it at build time.
 
-**Resolution with backtracking** (§18.1 extension): a backtracking resolver
+**Resolution with backtracking** (§19.1 extension): a backtracking resolver
 could try `openssl@1.1` instead, but then `curl`'s constraint fails. The
 conflict is genuine — no solution exists under single-version coherence.
 
@@ -3004,9 +3004,295 @@ build pattern is **type-checked**: `DerivingVia PythonPackage` only works for
 types that structurally match what `PythonPackage` expects.
 
 
-## §18 Open Questions and Extensions
+## §18 Quantified Constraints: Properties of Entire Package Sets
 
-### 18.1 Backtracking
+Haskell's `QuantifiedConstraints` extension allows universally quantified
+constraints in instance contexts and type signatures:
+
+```haskell
+{-# LANGUAGE QuantifiedConstraints #-}
+
+instance (forall a. Eq a => Eq (f a)) => Eq (Compose f g a) where ...
+```
+
+This says: "if `f` preserves `Eq` for ALL types, then `Compose f g` has `Eq`."
+The quantifier ranges over all types — a statement about a property holding
+*universally*.
+
+Applied to packages, quantified constraints let us state and enforce
+properties about **entire package sets**, **all packages at once**, or
+**all possible configurations**. This is the level of abstraction where
+package management policy lives.
+
+### 18.1 Package Set Compatibility
+
+"Every package available in A is also available in B" — B is a superset of A:
+
+```haskell
+-- Encoding A (multi-class):
+type Subset a b =
+  ( forall pkgs. HasZlib pkgs    => HasZlib pkgs      -- trivial, but illustrates
+  , forall pkgs. HasOpenssl pkgs => HasOpenssl pkgs
+  , ...
+  )
+```
+
+More usefully with Encoding C (single `Has` class):
+
+```haskell
+-- "For every package name, if A has it, B has it"
+type Superset b a = forall name. Has name a => Has name b
+```
+
+This enables **migration safety**: before switching from one package set to
+another, assert at compile time that nothing is lost:
+
+```haskell
+-- This function only compiles if NixpkgsNew has everything NixpkgsOld had:
+migrate :: Superset NixpkgsNew NixpkgsOld => Migration
+```
+
+If `NixpkgsNew` dropped a package that `NixpkgsOld` had, the quantified
+constraint fails — compile-time error.
+
+### 18.2 Overlay Preservation Guarantees
+
+An overlay changes some packages but should preserve others. Quantified
+constraints express this:
+
+```haskell
+-- "Applying overlay f to any pkgs preserves all Has instances":
+class (forall name pkgs. Has name pkgs => Has name (f pkgs))
+  => PreservesAll f
+
+-- "Overlay f preserves package p specifically":
+class (forall pkgs. Has p pkgs => Has p (f pkgs))
+  => Preserves f p
+```
+
+A **safe overlay** type:
+
+```haskell
+-- An overlay that guarantees it only modifies the declared packages:
+data SafeOverlay (modified :: [Symbol]) (f :: * -> *)
+
+class ( forall name pkgs. (Has name pkgs, NotElem name modified)
+          => Has name (f pkgs)
+      ) => SafeOverlay modified f
+```
+
+If the overlay claims it only modifies `"openssl"` but actually breaks
+`"curl"`, the quantified constraint catches it: GHC requires a proof that
+`Has "curl" (f pkgs)` follows from `Has "curl" pkgs`, and if `f` broke curl,
+no such proof exists.
+
+### 18.3 Package Set Transformers
+
+A **transformer** maps one package set to another, uniformly. Quantified
+constraints describe what the transformer preserves or changes.
+
+**Hardening transformer** — applies security flags to all packages:
+
+```haskell
+newtype Hardened pkgs = Hardened pkgs
+
+class ( forall name. Has name pkgs => Has name (Hardened pkgs)
+      ) => Hardenable pkgs
+
+instance Hardenable pkgs => Has name (Hardened pkgs) where
+  dep = applyHardeningFlags (dep @name @pkgs)
+```
+
+The quantified constraint guarantees: if the base set has a package, the
+hardened set has it too. No packages are lost by hardening.
+
+**Instrumentation transformer** — adds profiling/coverage to all builds:
+
+```haskell
+newtype Profiled pkgs = Profiled pkgs
+
+class ( forall name. Has name pkgs => Has name (Profiled pkgs)
+      ) => Profilable pkgs
+```
+
+**Pinning transformer** — freezes all versions:
+
+```haskell
+newtype Pinned (lock :: [(Symbol, Version)]) pkgs = Pinned pkgs
+
+class ( forall name. Has name pkgs => Has name (Pinned lock pkgs)
+      , forall name. Has name (Pinned lock pkgs)
+          => Ver name (Pinned lock pkgs) ~ LookupLock name lock
+      ) => ValidLock lock pkgs
+```
+
+The second quantified constraint says: for every package in the pinned set,
+its version matches the lock file. This is a lock file validity check as a
+type-level proof.
+
+### 18.4 Cross-Compilation Universality
+
+"Every native package has a cross-compiled counterpart":
+
+```haskell
+class ( forall name. Has name Native => Has name (Cross target)
+      ) => FullyCross target
+```
+
+This is a strong guarantee: the cross-compilation setup is complete. If even
+one package fails to cross-compile, the quantified constraint fails.
+
+**Partial cross-compilation** — only certain packages cross-compile:
+
+```haskell
+class ( forall name. (Has name Native, Crossable name)
+          => Has name (Cross target)
+      ) => PartiallyCross target
+```
+
+The `Crossable name` predicate marks which packages support cross-compilation.
+Trying to cross-compile a non-crossable package is a type error.
+
+### 18.5 Reproducibility
+
+"Two package sets produce bit-identical outputs for every package":
+
+```haskell
+class ( forall name. (Has name A, Has name B)
+          => OutputHash name A ~ OutputHash name B
+      ) => Reproducible A B
+```
+
+This is the type-level encoding of Nix's reproducibility guarantee. A
+deployment pipeline can require:
+
+```haskell
+deploy :: Reproducible StagingPkgs ProdPkgs => ProdPkgs -> IO ()
+```
+
+The function only compiles if staging and production are proven identical.
+The quantified constraint ranges over ALL packages — not just the ones you
+remember to check.
+
+### 18.6 Higher-Kinded Package Abstractions
+
+Quantified constraints enable **abstractions over package set operations**:
+
+```haskell
+-- A "package set functor" — transforms packages uniformly:
+class ( forall name pkgs. Has name pkgs => Has name (f pkgs)
+      ) => PkgSetFunctor f
+
+-- Compose two functors:
+instance (PkgSetFunctor f, PkgSetFunctor g)
+  => PkgSetFunctor (Compose f g)
+```
+
+Now you can build pipelines of transformations with guaranteed preservation:
+
+```haskell
+type Pipeline = Compose Hardened (Compose Profiled (Pinned MyLockFile))
+-- Pipeline is a PkgSetFunctor: it preserves all packages
+```
+
+**Package set natural transformations.** A function between two package set
+transformers that preserves structure:
+
+```haskell
+-- "For any package set, converting from f to g preserves all packages":
+type NatTrans f g = forall pkgs. (PkgSetFunctor f, PkgSetFunctor g)
+                  => f pkgs -> g pkgs
+```
+
+### 18.7 Conditional Entailment
+
+"If a package set satisfies property P, then it also satisfies Q":
+
+```haskell
+-- Any package set with a full network stack also has TLS:
+class ( forall pkgs. HasNetworkStack pkgs => HasTls pkgs
+      ) => NetworkImpliesTls
+```
+
+This encodes **package policy rules** — invariants about the relationships
+between packages that must hold across all configurations. Policy violations
+are type errors.
+
+More examples:
+
+```haskell
+-- Security policy: any production set must have hardened openssl:
+class ( forall pkgs. ProductionReady pkgs
+          => (Has "openssl" pkgs, OpensslFlags pkgs ~ 'Hardened)
+      ) => SecurityPolicy
+
+-- License policy: any redistributable set has only free packages:
+class ( forall name pkgs. (Has name pkgs, Redistributable pkgs)
+          => License name pkgs ~ 'Free
+      ) => LicensePolicy
+```
+
+### 18.8 The `callPackage` Pattern
+
+Nix's `callPackage` fills function arguments from the package set. With
+quantified constraints, we can express this generically:
+
+```haskell
+-- A type family listing what a package needs:
+type family Deps (name :: Symbol) :: [Symbol]
+type instance Deps "openssl" = '["zlib", "perl"]
+type instance Deps "curl"    = '["openssl", "zlib"]
+
+-- "All dependencies of name are available in pkgs":
+type family AllAvailable (deps :: [Symbol]) pkgs :: Constraint where
+  AllAvailable '[]       pkgs = ()
+  AllAvailable (d ': ds) pkgs = (Has d pkgs, AllAvailable ds pkgs)
+
+-- callPackage: resolve a package given that all its deps are met:
+callPackage :: AllAvailable (Deps name) pkgs => Has name pkgs => Derivation
+callPackage = dep @name
+```
+
+With quantified constraints, we can state a property about `callPackage`
+itself:
+
+```haskell
+-- "For any package whose deps are all available, callPackage succeeds":
+class ( forall name. AllAvailable (Deps name) pkgs => Has name pkgs
+      ) => Complete pkgs
+```
+
+`Complete pkgs` means the package set is **self-contained**: every package
+that *could* be built (all deps available) *is* built. This is the
+fixed-point property (§5) expressed as a quantified constraint.
+
+### 18.9 Summary
+
+| Quantified constraint use | What it expresses |
+|---|---|
+| Subset/superset (§18.1) | Migration safety between sets |
+| Overlay preservation (§18.2) | Overlay doesn't break unmodified packages |
+| Transformers (§18.3) | Uniform operations preserve completeness |
+| Cross-compilation (§18.4) | All (or specific) packages cross-compile |
+| Reproducibility (§18.5) | Bit-identical outputs across sets |
+| Higher-kinded (§18.6) | Composable package set pipelines |
+| Conditional entailment (§18.7) | Policy rules: security, licensing |
+| `callPackage` (§18.8) | Self-containedness of the package set |
+
+The common thread: quantified constraints lift reasoning from **individual
+packages** to **entire package sets**. Without them, you can say "this
+package set has openssl." With them, you can say "this overlay preserves
+every package it doesn't modify" or "these two sets are identical for all
+packages" — universal properties that hold by construction.
+
+In Nix, these properties are tested empirically (CI builds all packages,
+diffoscope checks reproducibility). With quantified constraints, they are
+**proven at compile time**.
+
+
+## §19 Open Questions and Extensions
+
+### 19.1 Backtracking
 
 The current calculus commits to `select`'s choice. If resolution of the
 selected declaration's dependencies fails, the whole resolution fails. An
@@ -3043,7 +3329,7 @@ Possible approaches:
 Approach (3) is essentially what SAT-based package managers do, but the second
 phase (lazy building) is what our calculus adds beyond them.
 
-### 18.2 Quantified Constraints
+### 19.2 Quantified Constraints
 
 Haskell's `QuantifiedConstraints` extension allows:
 
@@ -3061,7 +3347,7 @@ This requires extending constraints with universal quantification, moving us
 from Horn clauses to hereditary Harrop formulas. The resolution algorithm
 becomes significantly more complex (essentially λProlog).
 
-### 18.3 Semantic Versioning as Type Change
+### 19.3 Semantic Versioning as Type Change
 
 A breaking change (major version bump) corresponds to a change in the
 "evidence type" — the package now provides a different interface. A minor
@@ -3074,7 +3360,7 @@ with structural subtyping on evidence:
 -- major bump:   C_new is incompatible with C_old
 ```
 
-### 18.4 Build-Time Configuration as Associated Types
+### 19.4 Build-Time Configuration as Associated Types
 
 A package parameterized by build configuration (e.g., Python with/without SSL)
 corresponds to a typeclass with **associated types**:
@@ -3088,7 +3374,7 @@ class Package p where
 In our calculus, this could be modeled by indexing evidence by a configuration
 parameter, making constraints richer.
 
-### 18.5 Proof Search Strategies
+### 19.5 Proof Search Strategies
 
 The current calculus uses depth-first resolution (like GHC). Alternatives:
 - Breadth-first (complete but slower)
