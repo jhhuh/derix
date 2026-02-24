@@ -810,7 +810,7 @@ In the typeclass world, this is an **incoherence**: two call sites require
 incompatible instances of the same class. In the package world, it's a version
 conflict. The calculus detects it statically — no need to discover it at build time.
 
-**Resolution with backtracking** (§15.1 extension): a backtracking resolver
+**Resolution with backtracking** (§16.1 extension): a backtracking resolver
 could try `openssl@1.1` instead, but then `curl`'s constraint fails. The
 conflict is genuine — no solution exists under single-version coherence.
 
@@ -2070,9 +2070,247 @@ thunks for sharing and demand-driven evaluation. The type level ensures that
 the runtime will not encounter version mismatches or missing packages.
 
 
-## §15 Open Questions and Extensions
+## §15 Bootstrap: Staged Self-Reference
 
-### 15.1 Backtracking
+### 15.1 The Bootstrap Problem
+
+A compiler must be compiled by a compiler. A C library must be linked by a
+linker that was itself linked by a C library. This is the **bootstrap problem**:
+the tools needed to build the system are part of the system being built.
+
+In nixpkgs, the bootstrap chain for the standard environment looks like:
+
+```
+bootstrap-tools    (stage 0: binary seed, downloaded)
+  → stdenv-stage1  (stage 1: minimal gcc built by stage 0)
+    → stdenv-stage2  (stage 2: glibc rebuilt by stage 1's gcc)
+      → stdenv-stage3  (stage 3: gcc rebuilt with stage 2's glibc)
+        → stdenv       (stage 4: final, self-hosting)
+```
+
+Each stage uses the previous stage's tools to build the next stage's tools.
+The final stdenv can build itself — it is a **fixed point** of the bootstrap
+function.
+
+Nixpkgs expresses this transparently because of two properties:
+1. **Purity**: each stage is a deterministic function of its inputs (the
+   previous stage), with no ambient state leaking in.
+2. **Laziness**: the bootstrap chain is only traversed when needed. If you
+   just want a pre-built `hello` package, you never force the early stages.
+
+Both properties are central to our calculus. This section shows how the
+typeclass encoding captures bootstrap naturally.
+
+### 15.2 Bootstrap as Staged Package Sets
+
+Each bootstrap stage is a different `pkgs` type. Cross-stage dependencies
+are expressed as instance constraints:
+
+```haskell
+-- Stage 0: binary seed (no dependencies — these are pre-built)
+data Stage0
+
+instance HasGcc Stage0 where
+  gcc = binarySeed "/nix/store/...-bootstrap-gcc"
+
+instance HasGlibc Stage0 where
+  glibc = binarySeed "/nix/store/...-bootstrap-glibc"
+
+instance HasBinutils Stage0 where
+  binutils = binarySeed "/nix/store/...-bootstrap-binutils"
+```
+
+```haskell
+-- Stage 1: rebuild gcc using stage 0's tools
+data Stage1
+
+instance HasGlibc Stage1 where
+  glibc = glibc @Stage0                      -- forward: still using seed glibc
+
+instance HasBinutils Stage1 where
+  binutils = binutils @Stage0                -- forward: still using seed binutils
+
+instance HasGcc Stage1 where
+  gcc = compile (gcc @Stage0)                -- BUILD gcc using stage 0's gcc
+    (Src "gcc" "13.2")
+    [glibc @Stage1, binutils @Stage1]
+```
+
+```haskell
+-- Stage 2: rebuild glibc using stage 1's gcc
+data Stage2
+
+instance HasGcc Stage2 where
+  gcc = gcc @Stage1                          -- forward: use stage 1's gcc
+
+instance HasBinutils Stage2 where
+  binutils = binutils @Stage0                -- forward
+
+instance HasGlibc Stage2 where
+  glibc = compile (gcc @Stage1)              -- BUILD glibc using stage 1's gcc
+    (Src "glibc" "2.38")
+    [binutils @Stage2]
+```
+
+```haskell
+-- Stage 3: rebuild gcc using stage 2's glibc
+data Stage3
+
+instance HasGlibc Stage3 where
+  glibc = glibc @Stage2                      -- forward: use rebuilt glibc
+
+instance HasBinutils Stage3 where
+  binutils = compile (gcc @Stage2)           -- rebuild binutils too
+    (Src "binutils" "2.41")
+    [glibc @Stage3]
+
+instance HasGcc Stage3 where
+  gcc = compile (gcc @Stage2)                -- BUILD gcc using rebuilt glibc
+    (Src "gcc" "13.2")
+    [glibc @Stage3, binutils @Stage3]
+```
+
+```haskell
+-- Final: the self-hosting package set
+data Final
+
+-- Everything forwards to stage 3:
+instance HasGcc Final where gcc = gcc @Stage3
+instance HasGlibc Final where glibc = glibc @Stage2
+instance HasBinutils Final where binutils = binutils @Stage3
+
+-- All other packages are built using the final toolchain:
+instance (HasGcc Final, HasGlibc Final) => HasZlib Final where
+  zlib = compile (gcc @Final) (Src "zlib" "1.3") [glibc @Final]
+
+instance (HasZlib Final, HasGcc Final) => HasOpenssl Final where
+  openssl = compile (gcc @Final) (Src "openssl" "3.1")
+    [zlib @Final, glibc @Final]
+```
+
+### 15.3 Why This Works: Laziness + Purity
+
+**Laziness.** If you ask for `openssl @Final`, GHC traces:
+
+```
+openssl @Final
+  → gcc @Final → gcc @Stage3
+      → gcc @Stage2
+          → gcc @Stage1
+              → gcc @Stage0 (binary seed)
+          → glibc @Stage2
+              → gcc @Stage1 → ... (sharing: already forced)
+              → binutils @Stage0 (binary seed)
+      → glibc @Stage3 → glibc @Stage2 → ... (sharing)
+      → binutils @Stage3 → ...
+  → zlib @Final → gcc @Final → ... (sharing: already forced)
+  → glibc @Final → glibc @Stage2 → ... (sharing)
+```
+
+The full bootstrap chain is traversed — but only because `openssl` needs it.
+If you ask for a package that only needs `Final`'s toolchain and all stages
+are already forced, you get cache hits immediately. And if you only need
+something from Stage 1, Stage 2 and 3 are never computed.
+
+**Purity.** Each stage is a pure function of the previous stage. The type
+system makes this explicit: `HasGcc Stage1` can only reference `Stage0`'s
+instances. There is no way for Stage 1 to accidentally use Stage 3's gcc —
+the types prevent it.
+
+**Sharing.** `gcc @Stage1` is built once and shared by everything in Stage 2
+that needs it. The typeclass dictionary mechanism provides this automatically.
+
+### 15.4 The Self-Hosting Fixed Point
+
+The bootstrap terminates when a stage can build itself. In Nix, this means
+the final stdenv's gcc, when used to compile gcc from source, produces a
+bit-identical binary. In our encoding:
+
+```haskell
+-- Self-hosting property (conceptual):
+-- compile (gcc @Final) (Src "gcc" "13.2") [...] ≡ gcc @Final
+```
+
+This is a **fixed-point equation**: the final gcc IS the result of building
+gcc with itself. Our calculus's fixed-point construction (§5) captures exactly
+this:
+
+```haskell
+Σ = fix (σ → { gcc ↦ compile (σ ! "gcc") (Src "gcc" ...) [...], ... })
+```
+
+The difference from normal package resolution is that bootstrap introduces
+**multiple stages** of the fixed point. Each stage is a partial fixed point
+(self-consistent but using external seeds), and the final stage is the full
+fixed point (self-hosting).
+
+### 15.5 Bootstrap in Encoding C
+
+In Encoding C (single `Has` class), stages are encoded as different `pkgs`
+types, exactly as above. The `#label` syntax works across stages:
+
+```haskell
+instance Has "gcc" Stage0 where
+  dep = binarySeed "gcc"
+
+instance Has "gcc" Stage0 => Has "gcc" Stage1 where
+  dep = compile (#gcc @Stage0) (Src "gcc" "13.2") [#glibc, #binutils]
+```
+
+Note `#gcc` in the dependency list resolves against `Stage1` (the current
+`pkgs`), while `#gcc @Stage0` explicitly references the previous stage. The
+`pkgs` type variable disambiguates which stage a label resolves in.
+
+### 15.6 With DataKinds: Type-Level Stage Tracking
+
+Stages can be promoted to a type-level natural, making the bootstrap
+structure visible in types:
+
+```haskell
+data Stage = S Nat | Final
+
+data PkgSet (stage :: Stage)
+
+instance Has "gcc" (PkgSet ('S 0)) where
+  dep = binarySeed "gcc"
+
+instance Has "gcc" (PkgSet ('S 0)) => Has "gcc" (PkgSet ('S 1)) where
+  dep = compile (dep @"gcc" @(PkgSet ('S 0))) (Src "gcc" "13.2") [#glibc]
+```
+
+A type family can enforce stage ordering:
+
+```haskell
+type family PrevStage (s :: Stage) :: Stage where
+  PrevStage ('S 0)   = TypeError ('Text "Stage 0 has no predecessor")
+  PrevStage ('S n)   = 'S (n - 1)
+  PrevStage 'Final   = 'S 3        -- or parameterize the final stage number
+```
+
+This prevents the impossible: referencing a future stage from an earlier one.
+
+### 15.7 The Correspondence
+
+| Bootstrap concept | Calculus concept | Typeclass encoding |
+|---|---|---|
+| Binary seed | Axiom (no premises) | Instance with no constraints |
+| Build stage | Intermediate fixed point | `pkgs` type per stage |
+| "Built by stage N" | Resolution in env N | Constraint on `StageN` |
+| Tool forwarding | Evidence reuse | Instance delegates to prior stage |
+| Self-hosting | Full fixed point | Final stage = `fix` |
+| Stage isolation | Environment scoping | Type prevents cross-stage leaks |
+| Bootstrap chain | Proof tree depth | Instance resolution depth |
+
+The bootstrap process is not a special case that needs special machinery.
+It is an instance of the general pattern: staged fixed-point construction
+with cross-stage evidence references. The calculus handles it because it
+was designed around exactly these primitives — laziness, sharing, and
+self-referential evidence environments.
+
+
+## §16 Open Questions and Extensions
+
+### 16.1 Backtracking
 
 The current calculus commits to `select`'s choice. If resolution of the
 selected declaration's dependencies fails, the whole resolution fails. An
@@ -2109,7 +2347,7 @@ Possible approaches:
 Approach (3) is essentially what SAT-based package managers do, but the second
 phase (lazy building) is what our calculus adds beyond them.
 
-### 15.2 Quantified Constraints
+### 16.2 Quantified Constraints
 
 Haskell's `QuantifiedConstraints` extension allows:
 
@@ -2127,7 +2365,7 @@ This requires extending constraints with universal quantification, moving us
 from Horn clauses to hereditary Harrop formulas. The resolution algorithm
 becomes significantly more complex (essentially λProlog).
 
-### 15.3 Semantic Versioning as Type Change
+### 16.3 Semantic Versioning as Type Change
 
 A breaking change (major version bump) corresponds to a change in the
 "evidence type" — the package now provides a different interface. A minor
@@ -2140,7 +2378,7 @@ with structural subtyping on evidence:
 -- major bump:   C_new is incompatible with C_old
 ```
 
-### 15.4 Build-Time Configuration as Associated Types
+### 16.4 Build-Time Configuration as Associated Types
 
 A package parameterized by build configuration (e.g., Python with/without SSL)
 corresponds to a typeclass with **associated types**:
@@ -2154,7 +2392,7 @@ class Package p where
 In our calculus, this could be modeled by indexing evidence by a configuration
 parameter, making constraints richer.
 
-### 15.5 Proof Search Strategies
+### 16.5 Proof Search Strategies
 
 The current calculus uses depth-first resolution (like GHC). Alternatives:
 - Breadth-first (complete but slower)
