@@ -810,7 +810,7 @@ In the typeclass world, this is an **incoherence**: two call sites require
 incompatible instances of the same class. In the package world, it's a version
 conflict. The calculus detects it statically — no need to discover it at build time.
 
-**Resolution with backtracking** (§19.1 extension): a backtracking resolver
+**Resolution with backtracking** (§20.1 extension): a backtracking resolver
 could try `openssl@1.1` instead, but then `curl`'s constraint fails. The
 conflict is genuine — no solution exists under single-version coherence.
 
@@ -3290,9 +3290,317 @@ diffoscope checks reproducibility). With quantified constraints, they are
 **proven at compile time**.
 
 
-## §19 Open Questions and Extensions
+## §19 Backpack: Module-Level Package Abstraction
 
-### 19.1 Backtracking
+GHC's Backpack system provides **module-level parameterization**: a package
+can depend on a module **signature** (interface) without committing to a
+specific implementation. The implementation is plugged in at configuration
+time through **mixins**. This offers an entirely different encoding of
+package management — one that avoids most GHC type-level extensions by
+operating at the module level instead.
+
+### 19.1 Signatures as Package Interfaces
+
+A module signature (`.hsig` file) declares what a package provides without
+saying how:
+
+```haskell
+-- Zlib.hsig
+signature Zlib where
+  data ZlibLib
+  zlib :: Derivation
+  zlibVersion :: Version
+  zlibHeaders :: Path
+```
+
+```haskell
+-- Openssl.hsig
+signature Openssl where
+  data OpensslLib
+  openssl :: Derivation
+  opensslVersion :: Version
+  opensslHeaders :: Path
+```
+
+These are **package interfaces** — the same role as class declarations in the
+typeclass encoding (§12), but at the module level. A signature says "I need
+a package that provides these things" without naming a specific version or
+build recipe.
+
+### 19.2 Indefinite Packages as Abstract Definitions
+
+A package that depends on signatures but not on concrete implementations is
+**indefinite** — it can be instantiated with any compatible module:
+
+```haskell
+-- Openssl implementation (indefinite: depends on Zlib signature)
+-- file: src/Openssl.hs
+module Openssl where
+
+import Zlib (zlib, zlibHeaders)
+
+openssl :: Derivation
+openssl = mkDrv "openssl" "3.1" [zlib]
+
+opensslVersion :: Version
+opensslVersion = v 3 1 0
+
+opensslHeaders :: Path
+opensslHeaders = "/include/openssl"
+```
+
+```cabal
+-- openssl-indef.cabal
+library
+  signatures:       Zlib
+  exposed-modules:  Openssl
+  build-depends:    base, derix-core
+```
+
+The `signatures: Zlib` line declares that this package needs a `Zlib`
+implementation but doesn't specify which one. The Haskell source code
+`import Zlib` works against the signature — type-checked against the
+interface, compiled against any implementation.
+
+This is the Backpack analogue of:
+```haskell
+-- Typeclass encoding:
+instance HasZlib pkgs => HasOpenssl pkgs where ...
+```
+
+Both say "given zlib, I can produce openssl." The typeclass version uses a
+type variable; the Backpack version uses a module signature.
+
+### 19.3 Instantiation as Package Set Construction
+
+The package set is a concrete package that instantiates all signatures:
+
+```cabal
+-- nixpkgs.cabal
+library
+  build-depends:
+    , zlib-impl          -- concrete: provides Zlib module
+    , openssl-indef      -- indefinite: needs Zlib
+    , curl-indef         -- indefinite: needs Openssl, Zlib
+    , python-indef       -- indefinite: needs Openssl, Zlib
+
+  mixins:
+    , openssl-indef requires (Zlib as Zlib)
+    , curl-indef    requires (Openssl as Openssl, Zlib as Zlib)
+    , python-indef  requires (Openssl as Openssl, Zlib as Zlib)
+```
+
+The `mixins` section wires the dependencies: `openssl-indef` gets its `Zlib`
+from `zlib-impl`, `curl-indef` gets its `Openssl` from `openssl-indef`
+(itself instantiated with `zlib-impl`), and so on.
+
+This IS the fixed point construction: the package set is defined as a
+self-consistent wiring of all signatures to implementations.
+
+### 19.4 Applicative Instantiation = Sharing = Coherence
+
+Backpack uses **applicative instantiation**: if two packages depend on the
+same signature and it is instantiated with the same module, they get the
+**same instance**. This is a fundamental semantic guarantee.
+
+In our calculus terms:
+- `curl-indef` imports `Zlib` → gets `zlib-impl`
+- `python-indef` imports `Zlib` → gets `zlib-impl`
+- These are the **same module** — same compiled code, same identity
+
+This is exactly the **coherence** property (§7) and the **sharing** property
+(§5.4). In the typeclass encoding, coherence means "one dictionary per type."
+In Backpack, applicative instantiation means "one module per signature
+instantiation." Same guarantee, different mechanism.
+
+The diamond dependency problem (§9.4) is solved by construction:
+```
+curl-indef   → Zlib.hsig → zlib-impl     ← same module!
+python-indef → Zlib.hsig → zlib-impl     ← same module!
+```
+
+No diamond conflict is possible because applicative instantiation forces
+agreement.
+
+### 19.5 Overlays as Re-Instantiation
+
+An overlay swaps an implementation while keeping the rest:
+
+```cabal
+-- nixpkgs-patched.cabal
+library
+  build-depends:
+    , zlib-impl          -- same
+    , openssl-indef      -- same indefinite package
+    , curl-indef
+    , python-indef
+
+  mixins:
+    -- Re-instantiate openssl with a patched zlib:
+    , openssl-indef requires (Zlib as Zlib)
+        -- but this time Zlib comes from zlib-patched, not zlib-impl
+```
+
+Or bump openssl itself:
+
+```cabal
+-- Replace openssl-indef with openssl-v32-indef:
+  mixins:
+    , openssl-v32-indef requires (Zlib as Zlib)      -- new version
+    , curl-indef requires (Openssl as Openssl, Zlib as Zlib)
+    , python-indef requires (Openssl as Openssl, Zlib as Zlib)
+```
+
+`curl-indef` and `python-indef` are unchanged — they depend on the `Openssl`
+signature, and the new instantiation provides a new implementation. The
+cascade is automatic: downstream packages see the new openssl because the
+mixin wiring changed.
+
+This is the Backpack analogue of Nix's `final: prev:` overlays and the
+typeclass encoding's newtype wrappers (§17.1).
+
+### 19.6 Separate Compilation
+
+A key advantage of Backpack over the typeclass encoding: **separate
+compilation**. An indefinite package is type-checked against its signatures
+independently. It doesn't need to see the implementation. This means:
+
+- `openssl-indef` is compiled once, against `Zlib.hsig`
+- It can be reused with `zlib@1.3` or `zlib@1.4` without recompilation
+- Only the final linking step resolves signatures to implementations
+
+In the typeclass encoding, GHC must specialize each class method per type,
+which can lead to code duplication. Backpack avoids this by delaying
+instantiation to link time.
+
+For large package sets (80,000+ packages in nixpkgs), this matters: you
+don't want to recompile the world when one package changes.
+
+### 19.7 Cross-Compilation via Signature Sets
+
+Cross-compilation is natural in Backpack: the toolchain is a set of
+signatures, and different platforms provide different implementations:
+
+```haskell
+-- Toolchain.hsig
+signature Toolchain where
+  cc      :: Tool
+  ld      :: Tool
+  ar      :: Tool
+  target  :: Platform
+```
+
+```cabal
+-- native-toolchain provides Toolchain for x86_64
+-- cross-aarch64-toolchain provides Toolchain for aarch64
+
+library my-package-native
+  mixins: my-package-indef requires (Toolchain from native-toolchain)
+
+library my-package-cross-arm
+  mixins: my-package-indef requires (Toolchain from cross-aarch64-toolchain)
+```
+
+The same indefinite package, two different instantiations — one native, one
+cross-compiled. The package source code doesn't change; only the wiring does.
+
+### 19.8 Bootstrap via Staged Instantiation
+
+The bootstrap chain (§15) maps to **staged instantiation**:
+
+```cabal
+-- Stage 0: binary seeds implement the toolchain signature
+library stage0-toolchain
+  exposed-modules: Toolchain    -- binary gcc, binutils, glibc
+
+-- Stage 1: rebuild gcc using stage0 toolchain
+library stage1-gcc
+  signatures: Toolchain
+  mixins: stage1-gcc-indef requires (Toolchain from stage0-toolchain)
+
+-- Stage 2: rebuild glibc using stage1 gcc
+library stage2-glibc
+  mixins: stage2-glibc-indef requires (Toolchain from stage1-toolchain)
+
+-- Final: self-hosting
+library final-toolchain
+  mixins: gcc-indef requires (Toolchain from stage3-toolchain)
+```
+
+Each stage instantiates the toolchain signature with the previous stage's
+output. The signature is the same at every stage — only the implementation
+changes.
+
+### 19.9 Backpack + Typeclasses: Hybrid Encoding
+
+Backpack and typeclasses are complementary. A hybrid encoding uses each
+where it is strongest:
+
+- **Backpack** for the coarse-grained structure: which packages exist, how
+  they wire together, separate compilation boundaries
+- **Typeclasses** for the fine-grained properties: version predicates,
+  associated types, superclass propagation, quantified constraints
+
+```haskell
+-- Zlib.hsig — Backpack signature with typeclass constraints
+signature Zlib where
+  import Derix.Types (Derivation, Version)
+
+  class HasZlib pkgs where
+    type ZlibVersion pkgs :: Version
+    zlib :: Derivation
+```
+
+```haskell
+-- Openssl.hs — indefinite module using both Backpack and typeclasses
+module Openssl where
+
+import Zlib (HasZlib(..), ZlibVersion)
+import Derix.Types
+
+class HasZlib pkgs => HasOpenssl pkgs where
+  openssl :: Derivation
+  openssl = mkDrv "openssl" "3.1" [zlib @pkgs]
+```
+
+The Backpack layer handles module structure and separate compilation. The
+typeclass layer handles version constraints, associated types, and the rich
+constraint language. Each mechanism does what it does best.
+
+### 19.10 Comparison
+
+| Aspect | Typeclass encoding | Backpack encoding |
+|---|---|---|
+| Abstraction level | Type | Module |
+| Package interface | Class declaration | `.hsig` signature |
+| Package definition | Instance declaration | Module implementation |
+| Package set | Concrete type | Cabal mixin instantiation |
+| Overlay | Newtype + GND | Re-instantiation |
+| Sharing/coherence | One dict per type | Applicative instantiation |
+| Separate compilation | No (specialization) | Yes |
+| Version predicates | Type families | Not directly (external) |
+| Associated types | Yes | Yes (abstract types in sigs) |
+| Superclass propagation | Yes | Module re-exports |
+| Quantified constraints | Yes | Not available |
+| Deriving | GND, DerivingVia | Not available |
+| GHC extensions needed | Many | None (Cabal-level) |
+| Composition | Newtype stacking | Mixin composition |
+| Closest to | GHC dictionary passing | ML functors / SML modules |
+
+**Backpack excels at**: large-scale structure, separate compilation, simplicity
+(no type-level gymnastics), clean overlay model via re-instantiation.
+
+**Typeclasses excel at**: rich constraints, associated types, automated
+generation (deriving), quantified properties, fine-grained version checking.
+
+**The hybrid** (§19.9) combines both: Backpack for structure, typeclasses
+for properties. This mirrors how real systems work — module systems handle
+the coarse structure, type systems handle the fine invariants.
+
+
+## §20 Open Questions and Extensions
+
+### 20.1 Backtracking
 
 The current calculus commits to `select`'s choice. If resolution of the
 selected declaration's dependencies fails, the whole resolution fails. An
@@ -3329,7 +3637,7 @@ Possible approaches:
 Approach (3) is essentially what SAT-based package managers do, but the second
 phase (lazy building) is what our calculus adds beyond them.
 
-### 19.2 Quantified Constraints
+### 20.2 Quantified Constraints
 
 Haskell's `QuantifiedConstraints` extension allows:
 
@@ -3347,7 +3655,7 @@ This requires extending constraints with universal quantification, moving us
 from Horn clauses to hereditary Harrop formulas. The resolution algorithm
 becomes significantly more complex (essentially λProlog).
 
-### 19.3 Semantic Versioning as Type Change
+### 20.3 Semantic Versioning as Type Change
 
 A breaking change (major version bump) corresponds to a change in the
 "evidence type" — the package now provides a different interface. A minor
@@ -3360,7 +3668,7 @@ with structural subtyping on evidence:
 -- major bump:   C_new is incompatible with C_old
 ```
 
-### 19.4 Build-Time Configuration as Associated Types
+### 20.4 Build-Time Configuration as Associated Types
 
 A package parameterized by build configuration (e.g., Python with/without SSL)
 corresponds to a typeclass with **associated types**:
@@ -3374,7 +3682,7 @@ class Package p where
 In our calculus, this could be modeled by indexing evidence by a configuration
 parameter, making constraints richer.
 
-### 19.5 Proof Search Strategies
+### 20.5 Proof Search Strategies
 
 The current calculus uses depth-first resolution (like GHC). Alternatives:
 - Breadth-first (complete but slower)
