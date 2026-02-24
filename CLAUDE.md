@@ -1,25 +1,33 @@
 # Typelevel Package Manager
 
-Research project exploring the correspondence between typeclass instance resolution
-and package dependency resolution.
+Research project: typeclass instance resolution IS package dependency resolution.
 
 ## Core Thesis
 
-Package resolution is proof search. A "resolved install plan" is a dictionary of
-evidence witnessing that all constraints are satisfiable. By framing package
-management in type-theoretic terms, we can leverage known results about coherence,
-decidability, and compositionality from PL theory.
+Both are **proof search in a lazy evidence environment**. A resolved package set
+(nixpkgs) and a resolved dictionary environment (GHC) are both **lazy fixed points**
+of a self-referential record of evidence thunks. Laziness is what makes the
+self-referential fixed point computable.
+
+The calculus operates at the **evidence level**: constraints are "types", evidence
+terms (derivations / dictionaries) are "terms", resolution is proof search.
+
+## Key Document
+
+- `doc/calculus.md` — the formal calculus (syntax, rules, semantics, metatheory)
 
 ## Project Structure
 
 ```
+doc/                — formal documents
+  calculus.md       — the core calculus specification
 artifacts/          — plans, devlog, skill files
   plan_*.md         — task plans
   devlog.md         — append-only decision journal
   skills/           — reusable patterns discovered during work
-src/                — implementation (language TBD)
+src/                — implementation (Haskell prototype, then Lean formalization)
 ```
 
 ## Status
 
-Early research / design phase.
+Formal calculus designed (pen-and-paper). Next: Haskell prototype.
