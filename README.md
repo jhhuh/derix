@@ -2,6 +2,8 @@
 
 **Managing packages with class.**
 
+*Typeclass instance resolution as package dependency resolution.*
+
 Derix explores a structural correspondence: package resolution and typeclass
 resolution are the same problem. Both are proof search in a lazy evidence
 environment. A resolved package set (nixpkgs) and a resolved dictionary
