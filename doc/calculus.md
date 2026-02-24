@@ -810,7 +810,7 @@ In the typeclass world, this is an **incoherence**: two call sites require
 incompatible instances of the same class. In the package world, it's a version
 conflict. The calculus detects it statically — no need to discover it at build time.
 
-**Resolution with backtracking** (§21.1 extension): a backtracking resolver
+**Resolution with backtracking** (§22.1 extension): a backtracking resolver
 could try `openssl@1.1` instead, but then `curl`'s constraint fails. The
 conflict is genuine — no solution exists under single-version coherence.
 
@@ -3925,7 +3925,398 @@ possible. It is, in a sense, the extension that turns Haskell's constraint
 system from a proof checker into a **dependency management system**.
 
 
-## §21 Open Questions and Extensions
+## §21 Type Families: Type-Level Computation for Package Resolution
+
+Type families are **type-level functions** — they compute types from types.
+They have appeared throughout this document (§14 `CmpVersion`, §16 associated
+types, §20 `DepsOf`), but their full power as a resolution mechanism deserves
+dedicated treatment.
+
+The central insight: **type family reduction IS dependency resolution**. When
+GHC reduces `Resolve "curl"`, it is literally performing proof search — looking
+up the definition, recursively resolving dependencies, and constructing the
+evidence. The type checker is the resolver.
+
+```haskell
+{-# LANGUAGE TypeFamilies, DataKinds, UndecidableInstances #-}
+```
+
+### 21.1 Open vs Closed: Two Package Models
+
+Type families come in two flavors, each modeling a fundamentally different
+package management philosophy.
+
+**Open type families** — instances can be added in any module:
+
+```haskell
+type family Resolve (name :: Symbol) :: Evidence
+
+-- In module Zlib:
+type instance Resolve "zlib" = 'Ev "zlib" ('V 1 3 0) '[]
+
+-- In module Openssl:
+type instance Resolve "openssl" = 'Ev "openssl" ('V 3 1 0) '[Resolve "zlib"]
+
+-- In a user's overlay module:
+type instance Resolve "mylib" = 'Ev "mylib" ('V 0 1 0) '[Resolve "zlib"]
+```
+
+This models **extensible package sets** — anyone can add packages, like
+nixpkgs with overlays. The set is open-ended; new packages can appear in
+any module.
+
+**Closed type families** — all equations in one declaration, ordered:
+
+```haskell
+type family Resolve (name :: Symbol) :: Evidence where
+  Resolve "openssl" = 'Ev "openssl" ('V 3 2 0) '[Resolve "zlib"]   -- priority 1
+  Resolve "openssl" = 'Ev "openssl" ('V 3 1 0) '[Resolve "zlib"]   -- never reached
+  Resolve "zlib"    = 'Ev "zlib" ('V 1 3 0) '[]
+  Resolve "curl"    = 'Ev "curl" ('V 8 5 0) '[Resolve "openssl", Resolve "zlib"]
+```
+
+Wait — closed type families don't allow duplicate LHS patterns in the same
+way. But the **ordering** of equations gives priority, which models
+**selection policy** (§7):
+
+```haskell
+-- Selection: try specific version first, fall back to general
+type family SelectImpl (name :: Symbol) (variant :: Symbol) :: Evidence where
+  SelectImpl "tls" "libressl" = ...      -- if variant matches, use this
+  SelectImpl "tls" _          = ...      -- default: openssl
+```
+
+**The correspondence:**
+
+| Type family flavor | Package model | Analogue |
+|---|---|---|
+| Open | Extensible, anyone can add | nixpkgs + overlays |
+| Closed | Fixed set, ordered priority | Lock file, pinned versions |
+| Associated | Per-class, varies by instance | Per-package-set configuration |
+
+### 21.2 Type Family Reduction as Resolution
+
+GHC's type family reduction is a rewriting system: it matches equations
+top-down and substitutes. This is exactly proof search.
+
+Define the evidence type and the resolver as a type family:
+
+```haskell
+data Evidence = Ev Symbol Version [Evidence]
+
+type family Resolve (name :: Symbol) :: Evidence where
+  Resolve "zlib"    = 'Ev "zlib"    ('V 1 3 0) '[]
+  Resolve "openssl" = 'Ev "openssl" ('V 3 1 0) '[Resolve "zlib"]
+  Resolve "curl"    = 'Ev "curl"    ('V 8 5 0) '[Resolve "openssl", Resolve "zlib"]
+  Resolve "python"  = 'Ev "python"  ('V 3 12 0) '[Resolve "openssl", Resolve "zlib"]
+```
+
+When GHC encounters `Resolve "python"`, it:
+
+1. Matches the equation for `"python"`
+2. Finds `'Ev "python" ('V 3 12 0) '[Resolve "openssl", Resolve "zlib"]`
+3. Recursively reduces `Resolve "openssl"` → needs `Resolve "zlib"` → base case
+4. Recursively reduces `Resolve "zlib"` → base case (or **sharing** if already reduced)
+5. Produces the full evidence tree
+
+This IS the resolution algorithm from §3-4, executed by GHC's type checker.
+The parallel:
+
+| Calculus concept | Type family mechanism |
+|---|---|
+| Constraint | Type-level `Symbol` (package name) |
+| Evidence | Promoted `Evidence` type |
+| Resolution rule [INST] | Type family equation |
+| Proof search | Top-down equation matching |
+| Sharing | GHC's type family reduction cache |
+| Cycle detection | GHC's loop detection (`-freduction-depth`) |
+| Resolution failure | Stuck type family (no matching equation) |
+
+### 21.3 Stuck Families as Resolution Failure
+
+When no type family equation matches, the family is **stuck** — it does not
+reduce. In the package world, a stuck family is an **unsatisfied dependency**:
+
+```haskell
+type family Resolve (name :: Symbol) :: Evidence where
+  Resolve "zlib"    = ...
+  Resolve "openssl" = ...
+  -- no equation for "missing-pkg"
+
+-- Usage:
+type Test = Resolve "missing-pkg"
+-- GHC: cannot reduce Resolve "missing-pkg"
+-- = dependency resolution failure
+```
+
+With `TypeError`, the failure message is readable:
+
+```haskell
+type family Resolve (name :: Symbol) :: Evidence where
+  Resolve "zlib"    = 'Ev "zlib" ('V 1 3 0) '[]
+  Resolve "openssl" = 'Ev "openssl" ('V 3 1 0) '[Resolve "zlib"]
+  Resolve name      = TypeError ('Text "Package " ':<>: 'ShowType name
+                                 ':<>: 'Text " not found in package set")
+```
+
+GHC reports: `Package "missing-pkg" not found in package set`. Compare to
+Nix's `error: attribute 'missing-pkg' missing` — same error, caught at
+compile time instead of evaluation time.
+
+### 21.4 Data Families: Per-Package Configuration
+
+**Data families** define indexed data types where each instance has its own
+representation. For packages, this means each package has its own
+configuration type:
+
+```haskell
+data family Config (name :: Symbol)
+
+data instance Config "openssl" = OpensslConfig
+  { opensslFips      :: Bool
+  , opensslNoSSL3    :: Bool
+  , opensslNoWeakCiphers :: Bool
+  }
+
+data instance Config "python" = PythonConfig
+  { pythonWithTk     :: Bool
+  , pythonWithSSL    :: Bool
+  , pythonOptLevel   :: Int
+  }
+
+data instance Config "gcc" = GccConfig
+  { gccLanguages     :: [String]    -- ["c", "c++", "fortran"]
+  , gccMultilib      :: Bool
+  }
+```
+
+Unlike a regular `data Config = Config ...` that must accommodate all
+packages in one type, data families give each package a **structurally
+distinct** configuration. A function that configures openssl only sees
+openssl's options:
+
+```haskell
+configureOpenssl :: Config "openssl" -> Derivation
+configureOpenssl cfg = mkDrv "openssl" (flags cfg)
+  where
+    flags cfg = [if opensslFips cfg then "--fips" else ""]
+             ++ [if opensslNoSSL3 cfg then "--no-ssl3" else ""]
+```
+
+**Default configurations** via another type family:
+
+```haskell
+type family DefaultConfig (name :: Symbol) :: Config name
+
+type instance DefaultConfig "openssl" =
+  'OpensslConfig 'True 'True 'True     -- secure defaults
+
+type instance DefaultConfig "python" =
+  'PythonConfig 'False 'True 2          -- no Tk, with SSL, -O2
+```
+
+This models Nix's `override` pattern: each package has its own set of
+knobs, and there are sensible defaults that can be overridden.
+
+### 21.5 Injective Type Families: Package Identity
+
+`TypeFamilyDependencies` enables **injective type families** — the output
+uniquely determines the input:
+
+```haskell
+{-# LANGUAGE TypeFamilyDependencies #-}
+
+type family StoreHash (name :: Symbol) (ver :: Version) = (h :: Symbol) | h -> name ver
+```
+
+The `| h -> name ver` annotation says: given a hash, you can recover the
+package name and version. This is **content addressing**: the hash uniquely
+identifies the package.
+
+```haskell
+type instance StoreHash "zlib" ('V 1 3 0) = "sha256-abc123"
+type instance StoreHash "openssl" ('V 3 1 0) = "sha256-def456"
+```
+
+Injectivity enables **reverse lookup**: given a store hash, GHC can infer
+which package produced it:
+
+```haskell
+-- GHC can infer name and ver from the hash:
+fromStore :: StoreHash name ver ~ hash => Proxy hash -> (Proxy name, Proxy ver)
+fromStore _ = (Proxy, Proxy)
+```
+
+This captures a fundamental property of Nix's content-addressed store:
+the store path determines the package. Here it's a type-level invariant.
+
+### 21.6 Type-Level Package Set Operations
+
+Type families enable bulk operations over package sets represented as
+type-level lists:
+
+**Map** — apply a transformation to every package:
+
+```haskell
+type family MapVersion (f :: Version -> Version) (pkgs :: [PkgEntry])
+    :: [PkgEntry] where
+  MapVersion f '[] = '[]
+  MapVersion f ('PkgE name ver ': rest) = 'PkgE name (f ver) ': MapVersion f rest
+```
+
+**Filter** — select packages matching a predicate:
+
+```haskell
+type family FilterByPred (pred :: Symbol -> Bool) (pkgs :: [PkgEntry])
+    :: [PkgEntry] where
+  FilterByPred pred '[] = '[]
+  FilterByPred pred ('PkgE name ver ': rest) =
+    If (pred name)
+      ('PkgE name ver ': FilterByPred pred rest)
+      (FilterByPred pred rest)
+```
+
+**Fold** — aggregate over the package set:
+
+```haskell
+-- Count packages:
+type family Length (pkgs :: [PkgEntry]) :: Nat where
+  Length '[] = 0
+  Length (_ ': rest) = 1 + Length rest
+
+-- Collect all dependency edges:
+type family AllEdges (pkgs :: [PkgEntry]) :: [DepEdge] where
+  AllEdges '[] = '[]
+  AllEdges ('PkgE name _ ': rest) =
+    Append (EdgesOf name) (AllEdges rest)
+```
+
+**Topological sort** — order packages by dependency depth:
+
+```haskell
+type family TopoSort (pkgs :: [PkgEntry]) (graph :: [DepEdge]) :: [Symbol] where
+  -- packages with no dependencies first, then their dependents, etc.
+  ...
+```
+
+These operations enable **type-level package set queries**: "how many
+packages depend on openssl?", "what is the dependency depth of python?",
+"is the package set topologically consistent?" — all answered at compile time.
+
+### 21.7 Closed Families for Selection Policy
+
+The closed type family's ordered matching models **version selection with
+priority** — the §7 selection policies as type-level computation:
+
+```haskell
+-- Most-specific policy: try exact match, then range, then any:
+type family SelectOpenssl (pred :: VerPred) :: Version where
+  SelectOpenssl ('Exact ('V 3 1 0))  = 'V 3 1 0
+  SelectOpenssl ('Exact ('V 3 2 0))  = 'V 3 2 0
+  SelectOpenssl ('AtLeast ('V 3 0 0)) = 'V 3 2 0     -- highest available
+  SelectOpenssl ('AtLeast ('V 1 0 0)) = 'V 3 2 0     -- still highest
+  SelectOpenssl 'Any                  = 'V 3 2 0     -- default to highest
+```
+
+**Generalized selection** across all packages:
+
+```haskell
+type family Select (name :: Symbol) (pred :: VerPred) :: Version where
+  -- openssl versions: 3.2 > 3.1 > 1.1
+  Select "openssl" ('AtLeast ('V 3 0 0)) = 'V 3 2 0
+  Select "openssl" ('AtLeast ('V 1 0 0)) = 'V 3 2 0    -- highest satisfying
+  Select "openssl" ('Range ('V 1 0 0) ('V 2 0 0)) = 'V 1 1 1  -- range match
+  -- zlib versions: 1.3 > 1.2
+  Select "zlib" ('AtLeast ('V 1 0 0)) = 'V 1 3 0
+  Select "zlib" 'Any = 'V 1 3 0
+  -- fallthrough:
+  Select name pred = TypeError ('Text "No version of " ':<>: 'ShowType name
+                                ':<>: 'Text " satisfies " ':<>: 'ShowType pred)
+```
+
+The equation ordering IS the selection priority. GHC tries top-down and
+commits to the first match — exactly the "no backtracking" policy of §7.
+The closed world assumption means no external module can add versions
+after the fact — this is a **locked** package set.
+
+### 21.8 Open Families for Extensible Package Sets
+
+Open type families model the opposite: anyone can add packages:
+
+```haskell
+-- Core packages (in base module):
+type family Resolve (name :: Symbol) :: Evidence
+type instance Resolve "zlib" = 'Ev "zlib" ('V 1 3 0) '[]
+type instance Resolve "openssl" = 'Ev "openssl" ('V 3 1 0) '[Resolve "zlib"]
+
+-- User extension (in overlay module):
+type instance Resolve "mylib" = 'Ev "mylib" ('V 0 1 0) '[Resolve "zlib"]
+```
+
+This is the **overlay model**: new packages can be added from any module.
+GHC ensures consistency — two modules cannot define `type instance Resolve
+"zlib"` differently (that would be a conflicting instance error). This IS
+coherence (§7): one version per package, enforced by the compiler.
+
+**The open/closed decision is the coherence/extensibility trade-off:**
+
+| | Open families | Closed families |
+|---|---|---|
+| Add packages | Any module | Only in the defining module |
+| Override versions | Not allowed (conflicts) | Ordered priority |
+| Coherence | By construction | By equation ordering |
+| Model | nixpkgs + overlays | Lock file / pinned set |
+| Separate compilation | Yes | No (all equations in one place) |
+
+### 21.9 Associated vs Top-Level: Scoping
+
+The choice between associated type families (in a class) and top-level type
+families (standalone) determines **scoping**:
+
+```haskell
+-- Associated: scoped per package set (varies by pkgs)
+class Has (name :: Symbol) pkgs where
+  type Ver name pkgs :: Version
+
+-- Top-level: global (one answer regardless of pkgs)
+type family GlobalVer (name :: Symbol) :: Version
+```
+
+For package management, this means:
+- **Associated**: version of openssl depends on which package set you're in.
+  `Ver "openssl" Nixpkgs` might be `'V 3 1 0` while `Ver "openssl" Unstable`
+  is `'V 3 2 0`.
+- **Top-level**: there is one global answer. Suitable for lock files or
+  single-set configurations.
+
+The associated form enables the `pkgs`-parameterized encodings (§11-§13).
+The top-level form is simpler and enables the closed-world optimizations
+of §21.7.
+
+### 21.10 Summary
+
+| Type family feature | Package management use |
+|---|---|
+| Open families (§21.1, §21.8) | Extensible package sets, overlays |
+| Closed families (§21.1, §21.7) | Locked sets, selection policies with priority |
+| Reduction as resolution (§21.2) | GHC type checker IS the resolver |
+| Stuck families (§21.3) | Unsatisfied dependencies as type errors |
+| Data families (§21.4) | Per-package configuration types |
+| Injective families (§21.5) | Content-addressed store identity |
+| Bulk operations (§21.6) | Map/filter/fold over package sets |
+| Associated families (§21.9) | Per-package-set versioning |
+
+Type families are the computational engine behind everything in §14-§20.
+`DataKinds` provides the data (promoted types). `ConstraintKinds` provides
+the constraints (dependencies as types). Type families provide the
+**computation** — the type-level functions that resolve, select, transform,
+and verify. Together, they turn GHC's type system into a complete package
+resolution engine.
+
+
+## §22 Open Questions and Extensions
+
+### 22.1 Backtracking
 
 ### 21.1 Backtracking
 
@@ -3964,7 +4355,7 @@ Possible approaches:
 Approach (3) is essentially what SAT-based package managers do, but the second
 phase (lazy building) is what our calculus adds beyond them.
 
-### 21.2 Quantified Constraints
+### 22.2 Quantified Constraints
 
 Haskell's `QuantifiedConstraints` extension allows:
 
@@ -3982,7 +4373,7 @@ This requires extending constraints with universal quantification, moving us
 from Horn clauses to hereditary Harrop formulas. The resolution algorithm
 becomes significantly more complex (essentially λProlog).
 
-### 21.3 Semantic Versioning as Type Change
+### 22.3 Semantic Versioning as Type Change
 
 A breaking change (major version bump) corresponds to a change in the
 "evidence type" — the package now provides a different interface. A minor
@@ -3995,7 +4386,7 @@ with structural subtyping on evidence:
 -- major bump:   C_new is incompatible with C_old
 ```
 
-### 21.4 Build-Time Configuration as Associated Types
+### 22.4 Build-Time Configuration as Associated Types
 
 A package parameterized by build configuration (e.g., Python with/without SSL)
 corresponds to a typeclass with **associated types**:
@@ -4009,7 +4400,7 @@ class Package p where
 In our calculus, this could be modeled by indexing evidence by a configuration
 parameter, making constraints richer.
 
-### 21.5 Proof Search Strategies
+### 22.5 Proof Search Strategies
 
 The current calculus uses depth-first resolution (like GHC). Alternatives:
 - Breadth-first (complete but slower)
