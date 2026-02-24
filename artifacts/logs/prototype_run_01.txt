@@ -1,0 +1,71 @@
+═══════════════════════════════════════════════════
+ Resolution Calculus — Haskell Prototype
+═══════════════════════════════════════════════════
+
+── §9.1 Basic Resolution with Sharing ──
+
+Environment:
+instance zlib@1.3.0 given ⊤
+instance openssl@3.1.0 given zlib@≥1.0.0
+instance curl@8.5.0 given openssl@≥3.0.0 ∧ zlib@≥1.0.0
+instance python@3.12.0 given openssl@≥3.0.0 ∧ zlib@≥1.2.0
+
+Forcing python:
+python@3.12.0
+  openssl@3.1.0
+    zlib@1.3.0
+  zlib@1.3.0
+
+Forcing curl (zlib and openssl are shared):
+curl@8.5.0
+  openssl@3.1.0
+    zlib@1.3.0
+  zlib@1.3.0
+
+── §9.4 Diamond Dependencies ──
+
+Environment:
+instance base@4.18.0 given ⊤
+instance text@2.0.0 given base@≥4.0.0
+instance parsec@3.1.0 given base@≥4.0.0 ∧ text@≥1.0.0
+instance aeson@2.2.0 given base@≥4.0.0 ∧ text@≥2.0.0
+instance myapp@1.0.0 given parsec@≥3.0.0 ∧ aeson@≥2.0.0
+
+Forcing myapp (diamond: parsec→text, aeson→text):
+myapp@1.0.0
+  parsec@3.1.0
+    base@4.18.0
+    text@2.0.0
+      base@4.18.0
+  aeson@2.2.0
+    base@4.18.0
+    text@2.0.0
+      base@4.18.0
+
+text from parsec == text from aeson: True
+
+── §9.3 Overlay ──
+
+Base: openssl is 3.1.0
+  openssl@3.1.0
+  zlib@1.3.0
+
+After overlay: openssl bumped to 3.2.0
+  openssl@3.2.0
+  zlib@1.3.0
+
+python in overlaid set (picks up openssl@3.2.0 automatically):
+python@3.12.0
+  openssl@3.2.0
+    zlib@1.3.0
+  zlib@1.3.0
+
+── Coherence Checks ──
+
+exampleEnv (non-overlapping): 
+  ✓ coherent
+
+cycleEnv (acyclicity check):
+  ✗ cycle detected: ["a","b","a"]
+
+── Done ──

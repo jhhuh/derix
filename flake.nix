@@ -10,6 +10,12 @@
     flake-utils.lib.eachDefaultSystem (system:
       let
         pkgs = nixpkgs.legacyPackages.${system};
+        ghc = pkgs.haskellPackages.ghcWithPackages (hp: with hp; [
+          containers
+          text
+          mtl
+          prettyprinter
+        ]);
       in
       {
         devShells.default = pkgs.mkShell {
@@ -18,7 +24,10 @@
             overmind
             tmux
 
-            # Will add language-specific tools as we pick an implementation language
+            # Haskell
+            ghc
+            cabal-install
+            haskellPackages.haskell-language-server
           ];
         };
       });

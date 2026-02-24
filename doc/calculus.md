@@ -31,6 +31,35 @@ This document defines a **resolution calculus** that makes this correspondence
 precise. The calculus operates at the **evidence level**: its "types" are
 constraints, its "terms" are evidence, and its central operation is proof search.
 
+### 1.1 Remark: Derivations All the Way Down
+
+The word "derivation" appears independently in three traditions, and its three
+senses collapse into one in this calculus:
+
+1. **Nix derivation.** In Nix, a *derivation* is a build recipe — a description
+   of how to *derive* a package from its source and dependencies. The function
+   `mkDerivation` takes inputs and produces a store path. The word comes from
+   "deriving one thing from another."
+
+2. **Logical derivation.** In proof theory, a *derivation* is a proof tree — a
+   sequence of rule applications that establishes a conclusion from premises.
+   When we resolve `Pkg(python, ≥ 3.12)`, we build a derivation tree where each
+   node is an application of an inference rule to its sub-derivations.
+
+3. **Haskell `deriving`.** The `deriving` keyword asks the compiler to
+   automatically *derive* a typeclass instance — i.e., to perform proof search
+   for evidence of the constraint. `deriving Eq` means "find a way to construct
+   evidence for `Eq` from the structure of this type."
+
+These are not merely analogous. In our calculus, they are the same object:
+
+> **Resolving a package's dependencies = deriving a derivation = building a proof tree.**
+
+The evidence term `inst(python, 3.12, inst(openssl, 3.1, ...), inst(zlib, 1.3, ...))` is
+simultaneously a Nix derivation (a build plan), a logical derivation (a proof tree),
+and the output of a `deriving` procedure (automated instance construction). The
+triple pun is the correspondence made manifest.
+
 
 ## §2 Syntax
 
@@ -98,7 +127,10 @@ This has the structure of a Haskell instance declaration:
 ```haskell
 instance (Eq a, Show a) => Ord (MyType a) where ...
 ```
-    ↕
+
+corresponds to:
+
+```
 instance mytype@1.0 given Pkg(eq, ≥ 1.0) ∧ Pkg(show, ≥ 2.0)
 ```
 
@@ -411,6 +443,41 @@ and irrevocable). Nix embraces it (overlays are the primary extension
 mechanism). The calculus supports both — coherence (§7) determines whether
 replacement is permitted.
 
+### 6.5 Overlay Propagation: Why Laziness Matters
+
+Consider why overlays compose well in Nix but would be painful in a strict
+system. In a strict resolver, replacing `openssl` requires:
+
+1. Identify all transitive dependents of `openssl`
+2. Topologically sort them
+3. Re-resolve each in order
+
+This is an explicit, eager graph traversal. In our lazy calculus, none of
+this is needed. The overlay simply replaces the entry and re-ties the fixed
+point. Dependents are re-resolved *automatically* when forced, because they
+reference `σ(openssl)` (the self-reference), which now points to the new
+version. The propagation is implicit in the fixed-point semantics.
+
+This is the same reason GHC doesn't need to explicitly propagate dictionary
+changes — if a superclass instance changes, all subclass dictionaries that
+reference it through the lazy record automatically pick up the new version.
+
+### 6.6 The Two Roles of `prev`
+
+In Nix overlays, `prev` serves two distinct purposes:
+
+1. **Fallback**: Packages not mentioned in the overlay come from `prev`.
+   In `Σ_base ⊕ O(σ, Σ_base)`, the `⊕` merge provides this.
+
+2. **Old value access**: The overlay can inspect what it's replacing.
+   E.g., `prev.python.overrideAttrs (old: { ... })` modifies the old
+   derivation rather than building from scratch.
+
+Our calculus captures (1) via the merge `⊕`. For (2), the overlay function
+receives `σ_prev` and can inspect its entries. In typeclass terms, this is
+like defining a new instance in terms of the old one — a form of instance
+inheritance that Haskell lacks but that is natural here.
+
 
 ## §7 Coherence
 
@@ -664,6 +731,133 @@ In practice, the re-thunking granularity is a design choice: conservative
 changed packages). The calculus supports both.
 
 
+### 9.4 Diamond Dependencies (Coherent)
+
+The "diamond dependency" is the classic package management challenge: two
+packages depend on a common dependency, and we need them to agree on the
+version.
+
+**Environment:**
+
+```
+Γ = { instance base@4.18   given ⊤
+    , instance text@2.0     given Pkg(base, ≥ 4.0)
+    , instance parsec@3.1   given Pkg(base, ≥ 4.0) ∧ Pkg(text, ≥ 1.0)
+    , instance aeson@2.2    given Pkg(base, ≥ 4.0) ∧ Pkg(text, ≥ 2.0)
+    , instance myapp@1.0    given Pkg(parsec, ≥ 3.0) ∧ Pkg(aeson, ≥ 2.0)
+    }
+```
+
+The diamond: `myapp → parsec → text` and `myapp → aeson → text`.
+
+**Resolution of `myapp`:**
+
+```
+force myapp
+  → force parsec
+      → force base  →  inst(base, 4.18, ★)     [memoize]
+      → force text
+          → lookup base  →  CACHE HIT            [sharing]
+          →  inst(text, 2.0, inst(base, ...))    [memoize]
+      →  inst(parsec, 3.1, inst(base, ...), inst(text, ...))  [memoize]
+  → force aeson
+      → lookup base  →  CACHE HIT               [sharing]
+      → lookup text  →  CACHE HIT               [sharing!]
+      →  inst(aeson, 2.2, inst(base, ...), inst(text, ...))  [memoize]
+  →  inst(myapp, 1.0, inst(parsec, ...), inst(aeson, ...))
+```
+
+Both `parsec` and `aeson` get the **same** `text` and `base` evidence, because
+the package set has exactly one entry per name and sharing is guaranteed. The
+diamond is resolved coherently by construction — no solver needed.
+
+This is the power of the typeclass model: coherence (one instance per type)
+is exactly the property that prevents diamond dependency conflicts.
+
+### 9.5 Version Conflict (Resolution Failure)
+
+**Environment:**
+
+```
+Γ = { instance openssl@1.1  given ⊤
+    , instance openssl@3.1   given ⊤
+    , instance curl@8.0      given Pkg(openssl, ≥ 3.0)
+    , instance legacy@1.0    given Pkg(openssl, [1.0, 2.0))
+    , instance myapp@1.0     given Pkg(curl, ≥ 8.0) ∧ Pkg(legacy, ≥ 1.0)
+    }
+```
+
+Under the most-specific policy (`select` picks the highest matching version):
+- `curl` needs `openssl ≥ 3.0` → selects `openssl@3.1`
+- `legacy` needs `openssl ∈ [1.0, 2.0)` → selects `openssl@1.1`
+- But coherence requires ONE version of `openssl` in `Σ`!
+
+Resolution fails because `select(Γ, openssl, ⊤)` picks `openssl@3.1` (highest),
+but then `legacy`'s constraint `Pkg(openssl, [1.0, 2.0))` is unsatisfied:
+`3.1 ⊭ [1.0, 2.0)`.
+
+In the typeclass world, this is an **incoherence**: two call sites require
+incompatible instances of the same class. In the package world, it's a version
+conflict. The calculus detects it statically — no need to discover it at build time.
+
+**Resolution with backtracking** (§11.1 extension): a backtracking resolver
+could try `openssl@1.1` instead, but then `curl`'s constraint fails. The
+conflict is genuine — no solution exists under single-version coherence.
+
+**Resolution with local scoping** (Scala model, §10.3): allow `curl` and `legacy`
+to see different versions of `openssl`. This breaks coherence but resolves the
+diamond. This is what `node_modules` duplication does.
+
+### 9.6 Overlay Cascade
+
+Demonstrating how an overlay triggers automatic re-resolution through the
+lazy fixed point.
+
+**Base environment** (from §9.1):
+
+```
+Σ_base = { zlib    ↦ inst(zlib, 1.3, ★)
+          , openssl ↦ inst(openssl, 3.1, inst(zlib, 1.3, ★))
+          , curl    ↦ inst(curl, 8.5, inst(openssl, ...), inst(zlib, ...))
+          , python  ↦ inst(python, 3.12, inst(openssl, ...), inst(zlib, ...))
+          }
+```
+
+(Assume all packages were forced in a prior session.)
+
+**Overlay**: replace `zlib` with a patched version:
+
+```
+O = λ(final, prev). { zlib ↦ inst(zlib, 1.3.1, ★) }
+```
+
+**New fixed point:**
+
+```
+Σ' = fix(σ ↦ Σ_base ⊕ O(σ, Σ_base))
+```
+
+Because the fixed point is re-tied, `σ(zlib)` now returns the patched `zlib@1.3.1`.
+Every package that transitively depends on `zlib` — `openssl`, `curl`, `python` —
+will see the new version when forced. The cascade is automatic:
+
+```
+force python in Σ'
+  → resolve Pkg(openssl, ≥ 3.0)
+      → force openssl in Σ'
+          → resolve Pkg(zlib, ≥ 1.0)
+              → force zlib in Σ'  →  inst(zlib, 1.3.1, ★)  [new!]
+          →  inst(openssl, 3.1, inst(zlib, 1.3.1, ★))      [rebuilt with new zlib]
+  → resolve Pkg(zlib, ≥ 1.2)
+      → force zlib in Σ'  →  CACHE HIT: inst(zlib, 1.3.1, ★)
+  →  inst(python, 3.12, inst(openssl, ...), inst(zlib, 1.3.1, ★))
+```
+
+One line in the overlay (`zlib ↦ ...`) caused `openssl`, `curl`, and `python`
+to all pick up the patched zlib. This is the compositionality that the lazy
+fixed point provides.
+
+
 ## §10 Relationship to Existing Systems
 
 ### 10.1 Haskell (GHC)
@@ -736,8 +930,37 @@ calculus offers a different perspective:
 The current calculus commits to `select`'s choice. If resolution of the
 selected declaration's dependencies fails, the whole resolution fails. An
 extension could add backtracking (try the next candidate), corresponding to
-Scala's implicit search or DPLL's conflict-driven clause learning. This
-complicates coherence analysis.
+Scala's implicit search or DPLL's conflict-driven clause learning.
+
+**The design space for backtracking:**
+
+| Strategy | Typeclass analogue | Package analogue | Coherence |
+|---|---|---|---|
+| No backtracking | GHC default | Nix (one version per attr) | Preserved |
+| Backtracking on failure | Scala implicits | apt/cargo solver | Weakened |
+| DPLL / CDCL | — | SAT-based solvers | N/A (different model) |
+| Tabled resolution | Prolog tabling (XSB) | Memoize failed branches | Preserved if deterministic |
+
+**Backtracking and laziness interact non-trivially.** In the current calculus,
+the package set `Σ` is monotone (thunks only move forward: `○ → ● → e`). With
+backtracking, a failed resolution might need to *undo* a memoized result and
+try a different version. This breaks monotonicity and complicates the fixed-point
+semantics.
+
+Possible approaches:
+1. **Backtrack before memoization**: only commit to `Σ` after the full
+   resolution succeeds. This preserves monotonicity but loses sharing during
+   the search phase.
+2. **Versioned memoization**: each backtrack point gets a version counter;
+   memoized results are invalidated on backtrack. More complex but preserves
+   some sharing.
+3. **Two-phase resolution**: first phase does backtracking search (without
+   memoization) to find a consistent assignment; second phase builds the lazy
+   fixed point with the determined versions. This separates "which versions"
+   (search) from "build them lazily" (fixed point).
+
+Approach (3) is essentially what SAT-based package managers do, but the second
+phase (lazy building) is what our calculus adds beyond them.
 
 ### 11.2 Quantified Constraints
 

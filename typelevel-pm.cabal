@@ -1,0 +1,23 @@
+cabal-version: 3.0
+name:          typelevel-pm
+version:       0.1.0.0
+synopsis:      Typeclass instance resolution as package dependency resolution
+license:       MIT
+
+executable typelevel-pm
+  default-language: GHC2021
+  hs-source-dirs:   src
+  main-is:          Main.hs
+  other-modules:
+    Resolve.Syntax
+    Resolve.Resolve
+    Resolve.Fix
+    Resolve.Overlay
+    Resolve.Coherence
+    Resolve.Pretty
+  build-depends:
+    , base           >= 4.18
+    , containers
+    , text
+    , mtl
+    , prettyprinter

@@ -56,3 +56,37 @@ adds the lazy fixed-point / overlay structure from Nix. Related formalisms inclu
 hereditary Harrop formulas (λProlog), logical frameworks (LF/Twelf), and focused
 proof search. The theoretical connections are rich but the implementation can
 start from the GHC-style model we understand well.
+
+## 2026-02-25 — Haskell prototype + calculus deepening + naming
+
+**Haskell prototype built** (`src/`). Key insight confirmed: Haskell's own laziness
+IS the calculus's operational semantics. No IORef, no explicit thunk management.
+A recursive `let` is the fixed point. `Map.Lazy` entries are thunks. GHC's runtime
+gives us sharing, black-hole detection, and demand-driven evaluation for free.
+
+Modules: Syntax, Resolve, Fix, Overlay, Coherence, Pretty, Main.
+The prototype runs all worked examples from the calculus doc:
+- Basic resolution with sharing (zlib shared between openssl and python)
+- Diamond dependencies (text shared between parsec and aeson, verified with ==)
+- Overlay cascade (bump openssl → python auto-picks up the new version)
+- Coherence checking (non-overlapping condition)
+- Cycle detection (acyclic dependency graph check)
+
+**Calculus deepened**:
+- Added §1.1 "Derivations All the Way Down" — the triple pun (Nix derivation,
+  logical derivation, Haskell deriving) is not metaphorical, it's structural.
+- Added §6.5-6.6 on overlay propagation and the two roles of `prev`
+- Added §9.4-9.6: diamond deps, version conflicts, overlay cascade examples
+- Expanded §11.1 on backtracking: design space table, interaction with laziness
+
+**Naming research**. Top candidates grouped by theme:
+
+*Triple pun*: **deriv**, **derivo** (Latin "I derive")
+*Evidence/proof*: **evince** ("to make evident" — contains evidence + instance),
+  **edict** (puns on "e-dict" = electronic dictionary), **entail**
+*Lazy/fixed-point*: **knot** (tying the knot), **thunk**
+*Wordplay*: **typix** (type + Nix)
+
+Favorites: **evince** (strongest semantics — the system evinces satisfiability),
+**derivo** (captures the triple pun), **knot** (captures the lazy fixed-point insight).
+No decision made yet — leaving it open.
