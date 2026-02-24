@@ -1,6 +1,6 @@
 # Derix
 
-**Typeclass instance resolution as package dependency resolution.**
+**Managing packages with class.**
 
 Derix explores a structural correspondence: package resolution and typeclass
 resolution are the same problem. Both are proof search in a lazy evidence
