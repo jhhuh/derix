@@ -810,7 +810,7 @@ In the typeclass world, this is an **incoherence**: two call sites require
 incompatible instances of the same class. In the package world, it's a version
 conflict. The calculus detects it statically — no need to discover it at build time.
 
-**Resolution with backtracking** (§16.1 extension): a backtracking resolver
+**Resolution with backtracking** (§17.1 extension): a backtracking resolver
 could try `openssl@1.1` instead, but then `curl`'s constraint fails. The
 conflict is genuine — no solution exists under single-version coherence.
 
@@ -2308,9 +2308,354 @@ was designed around exactly these primitives — laziness, sharing, and
 self-referential evidence environments.
 
 
-## §16 Open Questions and Extensions
+## §16 Associated Types: Typed Package Interfaces
 
-### 16.1 Backtracking
+Haskell typeclasses support **associated types** — type families declared
+inside a class, with each instance providing its own definition:
+
+```haskell
+class Container c where
+  type Elem c :: *
+  empty :: c
+  insert :: Elem c -> c -> c
+
+instance Container [a] where
+  type Elem [a] = a
+  ...
+```
+
+The associated type `Elem` varies per instance — it is *determined by* the
+class parameter. Applied to packages, this means: the type of a package's
+output, its configuration, its platform target, or even its dependency set
+can vary per package set. This is a level of polymorphism that Nix's
+untyped attribute sets cannot express.
+
+### 16.1 Typed Package Outputs
+
+In Nix, every package output is a store path — an untyped string. A C library
+and a Python interpreter have the same type. With associated types, each
+package declares *what kind of thing it produces*:
+
+```haskell
+class HasZlib pkgs where
+  type ZlibOutput pkgs :: *
+  zlib :: ZlibOutput pkgs
+
+data CLib = CLib
+  { libPath     :: Path
+  , headerPath  :: Path
+  , pkgConfig   :: Path
+  }
+
+data HeaderOnly = HeaderOnly { headerPath :: Path }
+
+instance HasZlib Nixpkgs where
+  type ZlibOutput Nixpkgs = CLib               -- full C library
+  zlib = CLib "/lib/libz.so" "/include/zlib.h" "/lib/pkgconfig/zlib.pc"
+
+instance HasZlib MinimalPkgs where
+  type ZlibOutput MinimalPkgs = HeaderOnly     -- headers only (e.g. WASM target)
+  zlib = HeaderOnly "/include/zlib.h"
+```
+
+A consumer that needs pkg-config:
+
+```haskell
+needsPkgConfig :: (HasZlib pkgs, ZlibOutput pkgs ~ CLib) => ...
+```
+
+This fails at compile time for `MinimalPkgs` — you get a type error, not
+a runtime "file not found." The associated type makes the package interface
+**structurally typed**: you can only use what the package set actually provides.
+
+**Multiple outputs.** Nix packages can have multiple outputs (`out`, `dev`,
+`lib`, `doc`). Associated types make each output's type explicit:
+
+```haskell
+class HasOpenssl pkgs where
+  type OpensslLib pkgs :: *         -- runtime: .so files
+  type OpensslDev pkgs :: *         -- development: headers + .a
+  type OpensslDoc pkgs :: *         -- documentation: man pages
+  opensslLib :: OpensslLib pkgs
+  opensslDev :: OpensslDev pkgs
+  opensslDoc :: OpensslDoc pkgs
+```
+
+Each output can have a different type. A build that only needs headers
+constrains `OpensslDev pkgs` but says nothing about `OpensslDoc pkgs` —
+documentation is never forced.
+
+### 16.2 Dependency Injection
+
+The classic use of associated types: **abstract over which implementation**
+satisfies a capability. The associated type records the choice:
+
+```haskell
+class HasTls pkgs where
+  type TlsImpl pkgs :: Symbol       -- "openssl", "libressl", or "boringssl"
+  tlsLib     :: Derivation
+  tlsHeaders :: Path
+  tlsVersion :: Version
+```
+
+Different package sets plug in different backends:
+
+```haskell
+instance HasTls Nixpkgs where
+  type TlsImpl Nixpkgs = "openssl"
+  tlsLib = openssl @Nixpkgs
+  ...
+
+instance HasTls LibrePkgs where
+  type TlsImpl LibrePkgs = "libressl"
+  tlsLib = libressl @LibrePkgs
+  ...
+```
+
+Code that works with any TLS backend:
+
+```haskell
+buildCurl :: HasTls pkgs => Derivation
+buildCurl = mkDrv "curl" [tlsLib @pkgs]
+```
+
+Code that requires a specific backend:
+
+```haskell
+-- Uses OpenSSL-specific engine API, won't work with LibreSSL:
+buildNginxWithEngines :: (HasTls pkgs, TlsImpl pkgs ~ "openssl") => Derivation
+```
+
+The second function type-checks against `Nixpkgs` but not `LibrePkgs`. The
+dependency injection is verified at compile time.
+
+In Nix, swapping openssl for libressl is done via an overlay, but nothing
+prevents code from using openssl-specific features that libressl doesn't have.
+The associated type catches this statically.
+
+### 16.3 Platform and Cross-Compilation
+
+The build/host/target triple as associated types of the package set:
+
+```haskell
+data Platform = X86_64Linux | Aarch64Linux | Aarch64Darwin | Wasm32 | ...
+
+class HasStdenv pkgs where
+  type BuildPlatform  pkgs :: Platform     -- where the build runs
+  type HostPlatform   pkgs :: Platform     -- where the result executes
+  type TargetPlatform pkgs :: Platform     -- what the result targets (for compilers)
+  stdenv :: Derivation
+```
+
+Native compilation:
+
+```haskell
+instance HasStdenv Nixpkgs where
+  type BuildPlatform  Nixpkgs = 'X86_64Linux
+  type HostPlatform   Nixpkgs = 'X86_64Linux
+  type TargetPlatform Nixpkgs = 'X86_64Linux
+```
+
+Cross-compilation to ARM:
+
+```haskell
+instance HasStdenv CrossAarch64 where
+  type BuildPlatform  CrossAarch64 = 'X86_64Linux
+  type HostPlatform   CrossAarch64 = 'Aarch64Linux
+  type TargetPlatform CrossAarch64 = 'Aarch64Linux
+```
+
+Type-safe platform constraints:
+
+```haskell
+-- Only available on Linux targets:
+buildSystemd :: (HasStdenv pkgs, HostPlatform pkgs ~ 'X86_64Linux) => Derivation
+
+-- Works on any POSIX host:
+type family IsPosix (p :: Platform) :: Bool where
+  IsPosix 'X86_64Linux   = 'True
+  IsPosix 'Aarch64Linux  = 'True
+  IsPosix 'Aarch64Darwin = 'True
+  IsPosix 'Wasm32        = 'False
+
+buildCoreutils :: (HasStdenv pkgs, IsPosix (HostPlatform pkgs) ~ 'True)
+               => Derivation
+```
+
+Attempting to build `coreutils` for WASM is a compile-time error. In Nix,
+platform-specific packages are guarded by runtime `assert` or `meta.platforms`
+checks. Here, the type system prevents the mistake before evaluation begins.
+
+### 16.4 Version-Dependent Interfaces
+
+The associated type can change based on the package version, modeling **API
+evolution**:
+
+```haskell
+data ApiLevel = V1Api | V3Api
+
+class HasOpenssl pkgs where
+  type OpensslApi pkgs :: ApiLevel
+  openssl :: Derivation
+```
+
+```haskell
+-- Old package set with OpenSSL 1.1:
+instance HasOpenssl LegacyPkgs where
+  type OpensslApi LegacyPkgs = 'V1Api
+
+-- Current package set with OpenSSL 3.x:
+instance HasOpenssl Nixpkgs where
+  type OpensslApi Nixpkgs = 'V3Api
+```
+
+```haskell
+-- Code that needs the v3 API (new OSSL_PROVIDER interface):
+useProviderApi :: (HasOpenssl pkgs, OpensslApi pkgs ~ 'V3Api) => ...
+
+-- Code that works with either API level:
+useTlsGeneric :: HasOpenssl pkgs => ...
+```
+
+This encodes semver at the type level: a major version bump changes the
+associated type (breaking the API contract), a minor bump doesn't. Code
+that depends on `OpensslApi pkgs ~ 'V3Api` explicitly documents its API
+requirement — and the compiler enforces it.
+
+### 16.5 Associated Constraints
+
+With `ConstraintKinds`, the associated type can be a **constraint itself**:
+
+```haskell
+{-# LANGUAGE ConstraintKinds #-}
+
+class HasPython pkgs where
+  type PythonDeps pkgs :: Constraint
+  python :: PythonDeps pkgs => Derivation
+```
+
+Different package sets can wire different dependencies:
+
+```haskell
+-- Full Python: depends on openssl, zlib, readline, ...
+instance HasPython Nixpkgs where
+  type PythonDeps Nixpkgs = (HasOpenssl Nixpkgs, HasZlib Nixpkgs,
+                             HasReadline Nixpkgs, HasSqlite Nixpkgs)
+  python = mkDrv "python" "3.12" [#openssl, #zlib, #readline, #sqlite]
+
+-- Minimal Python: only zlib
+instance HasPython MinimalPkgs where
+  type PythonDeps MinimalPkgs = HasZlib MinimalPkgs
+  python = mkDrv "python-minimal" "3.12" [#zlib]
+```
+
+This is strictly more flexible than superclass context (§12): superclass
+constraints are fixed per class, but associated constraints vary per
+instance. The dependency set is part of the **implementation**, not the
+**interface**.
+
+The trade-off: with superclass context, consumers of `HasPython pkgs`
+automatically get `HasZlib pkgs`. With associated constraints, they don't —
+the deps are opaque. Use superclass context for **always-propagated** deps
+(§12.4) and associated constraints for **implementation-specific** deps.
+
+### 16.6 Content-Addressed Outputs
+
+The content hash as an associated type captures **binary reproducibility**
+in the type system:
+
+```haskell
+class HasZlib pkgs where
+  type ZlibHash pkgs :: Symbol
+  zlib :: Derivation
+
+instance HasZlib Nixpkgs where
+  type ZlibHash Nixpkgs = "sha256-abc123..."
+  zlib = mkDrv "zlib" "1.3" []
+
+instance HasZlib NixpkgsReproduced where
+  type ZlibHash NixpkgsReproduced = "sha256-abc123..."   -- same hash!
+  zlib = mkDrv "zlib" "1.3" []
+```
+
+Two package sets producing the same hash are type-level witnesses of
+reproducibility:
+
+```haskell
+-- Prove two builds are identical:
+type Reproducible name pkgs1 pkgs2 =
+  ZlibHash pkgs1 ~ ZlibHash pkgs2
+
+-- A function that requires reproducibility:
+deployToProduction :: Reproducible "zlib" StagingPkgs ProdPkgs => ...
+```
+
+This captures Nix's content-addressed store paths at the type level. A
+deployment pipeline can require, as a type constraint, that staging and
+production use bit-identical packages. The compiler verifies it.
+
+### 16.7 Build System Abstraction
+
+The build system as an associated type — different package sets can use
+different build infrastructure:
+
+```haskell
+data BuildSys = MakeStyle | CMakeStyle | MesonStyle | CargoStyle
+
+class HasOpenssl pkgs where
+  type OpensslBuildSys pkgs :: BuildSys
+  openssl :: Derivation
+
+instance HasOpenssl Nixpkgs where
+  type OpensslBuildSys Nixpkgs = 'MakeStyle       -- ./configure && make
+  openssl = makeBasedBuild "openssl" ...
+
+instance HasOpenssl ModernPkgs where
+  type OpensslBuildSys ModernPkgs = 'CMakeStyle    -- cmake
+  openssl = cmakeBasedBuild "openssl" ...
+```
+
+Build infrastructure that depends on the build system:
+
+```haskell
+-- Generic build wrapper:
+class BuildWith (sys :: BuildSys) where
+  configure :: Derivation -> Derivation
+  compile   :: Derivation -> Derivation
+  install   :: Derivation -> Derivation
+
+-- A function that only works with cmake-based packages:
+addCMakeFlag :: (HasOpenssl pkgs, OpensslBuildSys pkgs ~ 'CMakeStyle)
+             => String -> Derivation
+```
+
+### 16.8 Summary
+
+| Associated type use | What varies per `pkgs` | Static guarantee |
+|---|---|---|
+| Output types (§16.1) | What the package produces | Consumers match the output shape |
+| Dependency injection (§16.2) | Which impl is used | Backend-specific code is guarded |
+| Platform (§16.3) | Build/host/target triple | Platform-specific code is guarded |
+| API level (§16.4) | Version-dependent interface | API requirements documented in types |
+| Associated constraints (§16.5) | The dependency set itself | Flexible wiring per package set |
+| Content hash (§16.6) | The output identity | Reproducibility as a type-level fact |
+| Build system (§16.7) | How the package is built | Build-system-specific code is guarded |
+
+The common thread: associated types let the **package set** determine not just
+*which* packages are available (the class instances) but *what shape* each
+package has (its output types, API level, platform, dependencies). The package
+set becomes a **type-level configuration** that propagates through the entire
+build, with the compiler checking consistency at every point.
+
+In Nix, these properties are dynamic: you discover at evaluation time that a
+package doesn't support WASM, or that libressl lacks an openssl-specific API.
+With associated types, they are static: the type checker catches mismatches
+before any package is built.
+
+
+## §17 Open Questions and Extensions
+
+### 17.1 Backtracking
 
 The current calculus commits to `select`'s choice. If resolution of the
 selected declaration's dependencies fails, the whole resolution fails. An
@@ -2347,7 +2692,7 @@ Possible approaches:
 Approach (3) is essentially what SAT-based package managers do, but the second
 phase (lazy building) is what our calculus adds beyond them.
 
-### 16.2 Quantified Constraints
+### 17.2 Quantified Constraints
 
 Haskell's `QuantifiedConstraints` extension allows:
 
@@ -2365,7 +2710,7 @@ This requires extending constraints with universal quantification, moving us
 from Horn clauses to hereditary Harrop formulas. The resolution algorithm
 becomes significantly more complex (essentially λProlog).
 
-### 16.3 Semantic Versioning as Type Change
+### 17.3 Semantic Versioning as Type Change
 
 A breaking change (major version bump) corresponds to a change in the
 "evidence type" — the package now provides a different interface. A minor
@@ -2378,7 +2723,7 @@ with structural subtyping on evidence:
 -- major bump:   C_new is incompatible with C_old
 ```
 
-### 16.4 Build-Time Configuration as Associated Types
+### 17.4 Build-Time Configuration as Associated Types
 
 A package parameterized by build configuration (e.g., Python with/without SSL)
 corresponds to a typeclass with **associated types**:
@@ -2392,7 +2737,7 @@ class Package p where
 In our calculus, this could be modeled by indexing evidence by a configuration
 parameter, making constraints richer.
 
-### 16.5 Proof Search Strategies
+### 17.5 Proof Search Strategies
 
 The current calculus uses depth-first resolution (like GHC). Alternatives:
 - Breadth-first (complete but slower)
