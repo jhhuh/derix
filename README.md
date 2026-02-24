@@ -44,6 +44,16 @@ dependencies are constraints, and resolution is proof search. Covers:
 - Coherence conditions and selection policies
 - Metatheory: soundness, determinism, termination, fixed-point existence
 
+### GHC Encoding Design Space ([`doc/encoding.md`](doc/encoding.md))
+
+How Haskell's type system features map to package management. Each GHC
+extension gets a section exploring its encoding potential:
+
+- GHC encodings (multi-class, indexed, hybrid with OverloadedLabels)
+- Superclass context, default methods, DataKinds, bootstrap
+- Associated types, deriving strategies, quantified constraints
+- Backpack, ConstraintKinds, type families, GADTs
+
 ### Haskell Prototype ([`src/`](src/))
 
 A working implementation demonstrating that **Haskell's laziness IS the
