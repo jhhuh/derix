@@ -1,10 +1,10 @@
 cabal-version: 3.0
-name:          typelevel-pm
+name:          derivix
 version:       0.1.0.0
-synopsis:      Typeclass instance resolution as package dependency resolution
+synopsis:      Derivix — typeclass instance resolution as package dependency resolution
 license:       MIT
 
-executable typelevel-pm
+executable derivix
   default-language: GHC2021
   hs-source-dirs:   src
   main-is:          Main.hs

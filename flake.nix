@@ -1,5 +1,5 @@
 {
-  description = "Typelevel Package Manager — research project";
+  description = "Derivix — typeclass instance resolution as package dependency resolution";
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixpkgs-unstable";

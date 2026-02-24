@@ -1,7 +1,7 @@
--- | Demonstration of the resolution calculus.
+-- | Derivix — demonstration of the resolution calculus.
 --
--- This executable runs the worked examples from doc/calculus.md §9,
--- showing that Haskell's laziness IS the calculus's operational semantics.
+-- Runs the worked examples from doc/calculus.md §9, showing that
+-- Haskell's laziness IS the calculus's operational semantics.
 {-# LANGUAGE OverloadedStrings #-}
 module Main where
 
@@ -53,7 +53,7 @@ cycleEnv =
 main :: IO ()
 main = do
   putStrLn "═══════════════════════════════════════════════════"
-  putStrLn " Resolution Calculus — Haskell Prototype"
+  putStrLn " Derivix — Resolution Calculus Prototype"
   putStrLn "═══════════════════════════════════════════════════"
   putStrLn ""
 
