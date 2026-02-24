@@ -95,10 +95,11 @@ nix develop -c cabal run derix
 
 ## Status
 
-Early research. The formal calculus and Haskell prototype are working.
-Next steps: Lean 4 formalization of the metatheory, richer constraint
-language (quantified constraints, backtracking), a parser for the
-instance declaration syntax.
+**Actively exploring the design space.** Nothing here is settled. The formal
+calculus document (`doc/calculus.md`) is a living sketchbook — sections may
+contradict each other as we explore different encodings and GHC features.
+The Haskell prototype in `src/` demonstrates the core lazy-fixed-point idea
+but does not track the document's evolving design.
 
 ## License
 
