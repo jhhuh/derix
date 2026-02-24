@@ -810,7 +810,7 @@ In the typeclass world, this is an **incoherence**: two call sites require
 incompatible instances of the same class. In the package world, it's a version
 conflict. The calculus detects it statically — no need to discover it at build time.
 
-**Resolution with backtracking** (§11.1 extension): a backtracking resolver
+**Resolution with backtracking** (§12.1 extension): a backtracking resolver
 could try `openssl@1.1` instead, but then `curl`'s constraint fails. The
 conflict is genuine — no solution exists under single-version coherence.
 
@@ -929,7 +929,213 @@ calculus offers a different perspective:
   is a possible extension
 
 
-## §11 Open Questions and Extensions
+## §11 GHC Encodings: Piggybacking the Constraint Solver
+
+The isomorphism is not just theoretical. Derix declarations can be **compiled
+into actual GHC typeclass instances**, letting GHC's constraint solver perform
+the resolution. If the compilation is faithful, then typeclass resolution
+literally IS package resolution.
+
+We present two encodings. Both use this common infrastructure:
+
+```haskell
+data Derivation = Drv String String [Derivation]
+  deriving Show
+
+mkDrv :: String -> String -> [Derivation] -> Derivation
+mkDrv = Drv
+```
+
+### 11.1 Encoding A: One Class per Package
+
+Each package becomes its own typeclass, parameterized by a type variable `pkgs`
+that represents the package set. Dependencies become constraints on `pkgs`.
+
+```haskell
+{-# LANGUAGE AllowAmbiguousTypes #-}
+
+class HasZlib pkgs where
+  zlib :: Derivation
+
+class HasOpenssl pkgs where
+  openssl :: Derivation
+
+class HasCurl pkgs where
+  curl :: Derivation
+
+class HasPython pkgs where
+  python :: Derivation
+```
+
+Instance declarations translate directly — the Derix context becomes the GHC
+constraint, the Derix head becomes the GHC class:
+
+```haskell
+-- Derix: instance () => zlib@1.3
+instance HasZlib pkgs where
+  zlib = mkDrv "zlib" "1.3" []
+
+-- Derix: instance zlib (>= 1.0) => openssl@3.1
+instance HasZlib pkgs => HasOpenssl pkgs where
+  openssl = mkDrv "openssl" "3.1" [zlib @pkgs]
+
+-- Derix: instance (openssl (>= 3.0), zlib (>= 1.0)) => curl@8.5
+instance (HasOpenssl pkgs, HasZlib pkgs) => HasCurl pkgs where
+  curl = mkDrv "curl" "8.5" [openssl @pkgs, zlib @pkgs]
+
+-- Derix: instance (openssl (>= 3.0), zlib (>= 1.2)) => python@3.12
+instance (HasOpenssl pkgs, HasZlib pkgs) => HasPython pkgs where
+  python = mkDrv "python" "3.12" [openssl @pkgs, zlib @pkgs]
+```
+
+The package set is a concrete type with no runtime content — it exists purely
+for instance selection:
+
+```haskell
+data Nixpkgs
+
+main = print (python @Nixpkgs)
+```
+
+**How it works.** The `pkgs` type variable IS the self-reference. When the
+instance body says `zlib @pkgs`, it means "get zlib from whatever package set
+I'm being resolved in" — exactly `self.zlib` in Nix. GHC resolves
+`HasPython Nixpkgs` by chasing the constraint chain:
+
+```
+HasPython Nixpkgs
+  → needs HasOpenssl Nixpkgs, HasZlib Nixpkgs
+  → HasOpenssl Nixpkgs needs HasZlib Nixpkgs
+  → HasZlib Nixpkgs: found (base instance)
+```
+
+**Sharing.** GHC creates one dictionary per (class, type) pair. `HasZlib Nixpkgs`
+produces one dictionary, shared by `openssl` and `python`.
+
+**Laziness.** Dictionary fields are thunks. If nobody asks for `curl @Nixpkgs`,
+its dictionary is never built.
+
+**Overlays** map to newtype wrappers with instance overrides:
+
+```haskell
+-- An overlay that bumps openssl to 3.2
+data PkgsV2
+
+-- Override openssl:
+instance HasOpenssl PkgsV2 where
+  openssl = mkDrv "openssl" "3.2" [zlib @PkgsV2]
+
+-- Forward unchanged packages:
+instance HasZlib PkgsV2 where
+  zlib = zlib @Nixpkgs
+```
+
+Now `python @PkgsV2` automatically picks up `openssl@3.2`. The generic instance
+`(HasOpenssl pkgs, HasZlib pkgs) => HasPython pkgs` matches with `pkgs = PkgsV2`,
+and `HasOpenssl PkgsV2` returns the overlay's version. The cascade is automatic —
+exactly how Nix overlays propagate through the fixed point.
+
+### 11.2 Encoding B: Single Indexed Class
+
+A single typeclass indexed by a type-level package name (`Symbol`):
+
+```haskell
+{-# LANGUAGE DataKinds, TypeFamilies, AllowAmbiguousTypes #-}
+import GHC.TypeLits (Symbol)
+
+class Resolve (name :: Symbol) where
+  resolve :: Derivation
+
+instance Resolve "zlib" where
+  resolve = mkDrv "zlib" "1.3" []
+
+instance Resolve "zlib" => Resolve "openssl" where
+  resolve = mkDrv "openssl" "3.1" [resolve @"zlib"]
+
+instance (Resolve "openssl", Resolve "zlib") => Resolve "python" where
+  resolve = mkDrv "python" "3.12" [resolve @"openssl", resolve @"zlib"]
+```
+
+Usage: `resolve @"python"` triggers the full resolution chain.
+
+**Version predicates** fit naturally with an associated type:
+
+```haskell
+class Resolve (name :: Symbol) where
+  type Ver name :: (Nat, Nat, Nat)
+  resolve :: Derivation
+
+instance Resolve "zlib" where
+  type Ver "zlib" = '(1, 3, 0)
+  resolve = mkDrv "zlib" "1.3" []
+
+instance (Resolve "zlib", CmpVersion (Ver "zlib") '(1,0,0) ~ 'GTE)
+  => Resolve "openssl" where
+  type Ver "openssl" = '(3, 1, 0)
+  resolve = mkDrv "openssl" "3.1" [resolve @"zlib"]
+```
+
+where `CmpVersion` is a closed type family performing version comparison at the
+type level. GHC checks the version constraint statically — a dependency on
+`zlib (>= 2.0)` when only `zlib@1.3` is available becomes a **compile-time type
+error**.
+
+**Overlays** are harder in this encoding. You cannot have two instances for
+`Resolve "openssl"` — GHC rejects duplicate instances for the same head. Options:
+
+1. **Add an overlay index**: `class Resolve (layer :: Nat) (name :: Symbol)`
+   where higher layers shadow lower ones.
+2. **Generate fresh modules**: each overlay produces a new Haskell module where
+   changed instances are redefined, importing unchanged ones.
+3. **Use backpack**: GHC's module-level parameterization can model package set
+   abstraction.
+
+None is as clean as Encoding A's newtype-per-overlay approach.
+
+### 11.3 Comparison
+
+| Aspect | Encoding A (Multi-class) | Encoding B (Indexed) |
+|---|---|---|
+| Classes generated | One per package | One total |
+| Reads as | `HasZlib pkgs` | `Resolve "zlib"` |
+| Self-reference | Explicit (`pkgs` variable) | Implicit (instance graph) |
+| Version predicates | Need per-class associated types | One associated type suffices |
+| Overlays | Newtype + instance override | Requires extra machinery |
+| Resembles | nixpkgs (`pkgs.zlib`) | A flat package registry |
+| GHC extensions needed | `AllowAmbiguousTypes` | + `DataKinds`, `TypeFamilies` |
+
+**Encoding A** is closer to the Nix model: `pkgs` is the first-class
+self-reference that threads through everything, and overlays are newtype
+wrappers. It scales naturally — adding a package is adding a class, which
+doesn't change existing instances.
+
+**Encoding B** is more uniform and better suited for mechanical generation
+from a package database. Version predicates are checked statically. But
+overlays require additional encoding effort.
+
+### 11.4 What GHC Provides for Free
+
+Under either encoding, GHC's runtime and type checker automatically provide:
+
+| Calculus concept | GHC mechanism |
+|---|---|
+| Proof search | Instance resolution |
+| Sharing | One dictionary per (class, type) pair |
+| Cycle detection | `<<loop>>` (runtime) or unsolvable constraints (compile time) |
+| Laziness | Dictionary thunks forced on demand |
+| Coherence checking | Overlapping instance rejection |
+| Error reporting | "No instance for ..." = unsatisfied dependency |
+
+What GHC does NOT provide:
+
+- **Backtracking**: GHC commits on first match (no DPLL-style search)
+- **Human-readable errors**: "No instance for `HasOpenssl PkgsV2`" needs
+  translation to "package openssl not found in overlay"
+- **Lock file generation**: the resolved set is implicit in the instance graph
+- **Version range solving**: needs type-level encoding (Encoding B) or external tooling
+
+
+## §12 Open Questions and Extensions
 
 ### 11.1 Backtracking
 
