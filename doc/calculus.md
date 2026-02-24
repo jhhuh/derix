@@ -1,4 +1,4 @@
-# Derivix: A Resolution Calculus for Package Management
+# Derix: A Resolution Calculus for Package Management
 
 ## §1 Motivation
 

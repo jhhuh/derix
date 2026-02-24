@@ -1,4 +1,4 @@
-# Derivix
+# Derix
 
 **derive + Nix.** Typeclass instance resolution as package dependency resolution.
 
@@ -23,7 +23,7 @@ terms (derivations / dictionaries) are "terms", resolution is proof search.
 
 ```
 doc/                — formal documents
-  calculus.md       — the Derivix calculus specification
+  calculus.md       — the Derix calculus specification
 artifacts/          — plans, devlog, skill files
   devlog.md         — append-only decision journal
   skills/           — reusable patterns discovered during work

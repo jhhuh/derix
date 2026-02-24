@@ -1,4 +1,4 @@
--- | Derivix — demonstration of the resolution calculus.
+-- | Derix — demonstration of the resolution calculus.
 --
 -- Runs the worked examples from doc/calculus.md §9, showing that
 -- Haskell's laziness IS the calculus's operational semantics.
@@ -53,7 +53,7 @@ cycleEnv =
 main :: IO ()
 main = do
   putStrLn "═══════════════════════════════════════════════════"
-  putStrLn " Derivix — Resolution Calculus Prototype"
+  putStrLn " Derix — Resolution Calculus Prototype"
   putStrLn "═══════════════════════════════════════════════════"
   putStrLn ""
 

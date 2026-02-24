@@ -1,8 +1,8 @@
-# Derivix
+# Derix
 
 **Typeclass instance resolution as package dependency resolution.**
 
-Derivix explores a structural correspondence: package resolution and typeclass
+Derix explores a structural correspondence: package resolution and typeclass
 resolution are the same problem. Both are proof search in a lazy evidence
 environment. A resolved package set (nixpkgs) and a resolved dictionary
 environment (GHC) are both lazy fixed points of a self-referential record
@@ -88,7 +88,7 @@ The prototype demonstrates:
 Requires [Nix](https://nixos.org/) with flakes enabled:
 
 ```sh
-nix develop -c cabal run derivix
+nix develop -c cabal run derix
 ```
 
 ## Status
