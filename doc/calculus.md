@@ -1092,26 +1092,99 @@ error**.
 
 None is as clean as Encoding A's newtype-per-overlay approach.
 
-### 11.3 Comparison
+### 11.3 Encoding C: Hybrid with OverloadedLabels
 
-| Aspect | Encoding A (Multi-class) | Encoding B (Indexed) |
-|---|---|---|
-| Classes generated | One per package | One total |
-| Reads as | `HasZlib pkgs` | `Resolve "zlib"` |
-| Self-reference | Explicit (`pkgs` variable) | Implicit (instance graph) |
-| Version predicates | Need per-class associated types | One associated type suffices |
-| Overlays | Newtype + instance override | Requires extra machinery |
-| Resembles | nixpkgs (`pkgs.zlib`) | A flat package registry |
-| GHC extensions needed | `AllowAmbiguousTypes` | + `DataKinds`, `TypeFamilies` |
+Encoding B uses string literals (`@"zlib"`) which are noisy. Encoding A avoids
+them but generates one class per package. The hybrid uses a single indexed class
+(like B) but with `OverloadedLabels` for clean syntax:
 
-**Encoding A** is closer to the Nix model: `pkgs` is the first-class
-self-reference that threads through everything, and overlays are newtype
-wrappers. It scales naturally — adding a package is adding a class, which
-doesn't change existing instances.
+```haskell
+{-# LANGUAGE DataKinds, OverloadedLabels, AllowAmbiguousTypes,
+             FlexibleInstances, UndecidableInstances #-}
 
-**Encoding B** is more uniform and better suited for mechanical generation
-from a package database. Version predicates are checked statically. But
-overlays require additional encoding effort.
+class Has (name :: Symbol) pkgs where
+  dep :: Derivation
+
+-- A single catch-all IsLabel instance — no per-package boilerplate:
+newtype Dep pkgs = Dep Derivation
+
+instance Has name pkgs => IsLabel name (Dep pkgs) where
+  fromLabel = Dep (dep @name @pkgs)
+```
+
+Now instance declarations use `#labels` for dependencies:
+
+```haskell
+instance Has "zlib" pkgs where
+  dep = mkDrv "zlib" "1.3" []
+
+instance Has "zlib" pkgs => Has "openssl" pkgs where
+  dep = mkDrv "openssl" "3.1" [#zlib]
+
+instance (Has "openssl" pkgs, Has "zlib" pkgs) => Has "wget" pkgs where
+  dep = mkDrv "wget" "1.21" [#zlib, #openssl]
+
+instance (Has "openssl" pkgs, Has "zlib" pkgs, Has "pcre2" pkgs)
+  => Has "wget" pkgs where
+  dep = mkDrv "wget" "1.21" [#zlib, #pcre2, #openssl]
+```
+
+`#zlib` desugars to `fromLabel @"zlib" :: Dep pkgs`, which calls
+`dep @"zlib" @pkgs` through the catch-all `IsLabel` instance. The `pkgs`
+type variable is inferred from context — it flows through automatically.
+
+**Fixed point and overlays** work exactly as in Encoding A:
+
+```haskell
+data Nixpkgs
+
+-- Base instances resolve against Nixpkgs:
+main = print (dep @"wget" @Nixpkgs)
+
+-- Overlay:
+data PkgsV2
+
+instance Has "openssl" PkgsV2 where
+  dep = mkDrv "openssl" "3.2" [#zlib]    -- #zlib resolves via Has "zlib" PkgsV2
+
+instance Has "zlib" PkgsV2 where
+  dep = dep @"zlib" @Nixpkgs              -- forward to base
+```
+
+`dep @"wget" @PkgsV2` picks up `openssl@3.2` automatically through the
+generic instance — same cascade as Encoding A.
+
+**Version predicates** use an associated type, as in Encoding B:
+
+```haskell
+class Has (name :: Symbol) pkgs where
+  type Ver name :: (Nat, Nat, Nat)
+  dep :: Derivation
+```
+
+This encoding combines the best of A and B: one class (uniform), `pkgs`
+parameter (self-reference + overlays), labels (no string literals in
+dependency lists).
+
+### 11.4 Comparison
+
+| Aspect | A (Multi-class) | B (Indexed) | C (Hybrid) |
+|---|---|---|---|
+| Classes generated | One per package | One total | One total |
+| Dependency syntax | `zlib @pkgs` | `resolve @"zlib"` | `#zlib` |
+| Self-reference | `pkgs` variable | Implicit | `pkgs` variable |
+| Version predicates | Per-class assoc. type | One assoc. type | One assoc. type |
+| Overlays | Newtype + override | Extra machinery | Newtype + override |
+| Resembles | nixpkgs | Package registry | nixpkgs + labels |
+| GHC extensions | `AllowAmbiguous` | + `DataKinds`, `TypeFamilies` | + `OverloadedLabels` |
+
+**Encoding A** is closest to the Nix model but generates many classes.
+
+**Encoding B** is uniform but has noisy syntax and difficult overlays.
+
+**Encoding C** combines uniform representation (one class) with clean syntax
+(`#zlib`) and natural overlays (`pkgs` parameter). It is the recommended
+encoding for a Derix-to-GHC compiler.
 
 ### 11.4 What GHC Provides for Free
 
@@ -1137,7 +1210,7 @@ What GHC does NOT provide:
 
 ## §12 Open Questions and Extensions
 
-### 11.1 Backtracking
+### 12.1 Backtracking
 
 The current calculus commits to `select`'s choice. If resolution of the
 selected declaration's dependencies fails, the whole resolution fails. An
@@ -1174,7 +1247,7 @@ Possible approaches:
 Approach (3) is essentially what SAT-based package managers do, but the second
 phase (lazy building) is what our calculus adds beyond them.
 
-### 11.2 Quantified Constraints
+### 12.2 Quantified Constraints
 
 Haskell's `QuantifiedConstraints` extension allows:
 
@@ -1192,7 +1265,7 @@ This requires extending constraints with universal quantification, moving us
 from Horn clauses to hereditary Harrop formulas. The resolution algorithm
 becomes significantly more complex (essentially λProlog).
 
-### 11.3 Semantic Versioning as Type Change
+### 12.3 Semantic Versioning as Type Change
 
 A breaking change (major version bump) corresponds to a change in the
 "evidence type" — the package now provides a different interface. A minor
@@ -1205,7 +1278,7 @@ with structural subtyping on evidence:
 -- major bump:   C_new is incompatible with C_old
 ```
 
-### 11.4 Build-Time Configuration as Associated Types
+### 12.4 Build-Time Configuration as Associated Types
 
 A package parameterized by build configuration (e.g., Python with/without SSL)
 corresponds to a typeclass with **associated types**:
@@ -1219,7 +1292,7 @@ class Package p where
 In our calculus, this could be modeled by indexing evidence by a configuration
 parameter, making constraints richer.
 
-### 11.5 Proof Search Strategies
+### 12.5 Proof Search Strategies
 
 The current calculus uses depth-first resolution (like GHC). Alternatives:
 - Breadth-first (complete but slower)
