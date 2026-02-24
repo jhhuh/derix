@@ -810,7 +810,7 @@ In the typeclass world, this is an **incoherence**: two call sites require
 incompatible instances of the same class. In the package world, it's a version
 conflict. The calculus detects it statically — no need to discover it at build time.
 
-**Resolution with backtracking** (§17.1 extension): a backtracking resolver
+**Resolution with backtracking** (§18.1 extension): a backtracking resolver
 could try `openssl@1.1` instead, but then `curl`'s constraint fails. The
 conflict is genuine — no solution exists under single-version coherence.
 
@@ -2653,9 +2653,360 @@ With associated types, they are static: the type checker catches mismatches
 before any package is built.
 
 
-## §17 Open Questions and Extensions
+## §17 Deriving: Automated Package Definitions
 
-### 17.1 Backtracking
+Haskell's `deriving` mechanism automatically generates typeclass instances
+from the structure of a type. In our encoding, instances ARE package
+definitions. So `deriving` becomes **automated package definition generation**
+— the compiler writes build recipes for you.
+
+There are four deriving strategies, each mapping to a different pattern of
+package automation.
+
+### 17.1 GeneralizedNewtypeDeriving: Zero-Cost Overlays
+
+`GeneralizedNewtypeDeriving` (GND) lets a newtype inherit all instances from
+its underlying type. Applied to package sets, this solves the **overlay
+forwarding problem**.
+
+Without GND, an overlay must manually forward every unchanged package:
+
+```haskell
+data PkgsV2
+instance HasZlib PkgsV2    where zlib    = zlib    @Nixpkgs   -- forward
+instance HasPerl PkgsV2    where perl    = perl    @Nixpkgs   -- forward
+instance HasCurl PkgsV2    where curl    = curl    @Nixpkgs   -- forward
+instance HasPython PkgsV2  where python  = python  @Nixpkgs   -- forward
+-- ... hundreds more ...
+instance HasOpenssl PkgsV2 where
+  openssl = mkDrv "openssl" "3.2" [#zlib]                     -- override
+```
+
+With GND, one `deriving` clause inherits the entire package set:
+
+```haskell
+{-# LANGUAGE GeneralizedNewtypeDeriving #-}
+
+newtype Patched = Patched Nixpkgs
+  deriving ( HasZlib, HasPerl, HasCurl, HasPython
+           , HasBinutils, HasCmake, HasNinja, HasGit
+           -- ... every package in nixpkgs
+           )
+
+-- Override only what changes:
+instance HasOpenssl Patched where
+  openssl = mkDrv "openssl" "3.2" [#zlib]
+```
+
+GND works by coercing the dictionary: since `Patched` is representationally
+identical to `Nixpkgs`, the `HasZlib Nixpkgs` dictionary can be reused as
+`HasZlib Patched` with zero runtime cost. This is exactly what Nix overlays
+do — unchanged packages are shared, not rebuilt.
+
+The critical consequence: `#zlib` inside the overridden `openssl` resolves
+against `Patched`, finding the inherited `HasZlib` instance (same as
+`Nixpkgs`). But `#openssl` in any inherited package that depends on openssl
+now finds the `Patched` override. The cascade is automatic.
+
+**Composing overlays** is newtype stacking:
+
+```haskell
+newtype SecurityPatched = SecurityPatched Nixpkgs
+  deriving (HasZlib, HasPerl, HasCurl, HasPython, ...)
+
+instance HasOpenssl SecurityPatched where
+  openssl = mkDrv "openssl" "3.2" [#zlib]        -- security bump
+
+newtype FullyPatched = FullyPatched SecurityPatched
+  deriving (HasZlib, HasPerl, HasOpenssl, HasPython, ...)
+                                -- ^ inherits the bumped openssl!
+
+instance HasCurl FullyPatched where
+  curl = mkDrv "curl" "8.6" [#openssl, #zlib]    -- also bump curl
+```
+
+`FullyPatched` has `openssl@3.2` (from `SecurityPatched`) and `curl@8.6`
+(overridden). Everything else inherits through the newtype chain. This is
+overlay composition — each layer is a newtype.
+
+**Limitation.** GND cannot derive classes with associated types (§16) because
+associated type instances cannot be coerced. For classes with associated
+types, use `DerivingVia` or `StandaloneDeriving` instead.
+
+### 17.2 DerivingVia: Build Pattern Templates
+
+`DerivingVia` derives an instance by specifying a **representation type**
+that already has the instance. In the package world, this is **build pattern
+templates** — the equivalent of `buildPythonPackage`, `buildRustPackage`,
+`mkDerivation` in Nix.
+
+Define a build pattern as a newtype:
+
+```haskell
+{-# LANGUAGE DerivingVia #-}
+
+-- A cmake-based package: give it a name, version, and deps, get a build.
+newtype CMakePackage (name :: Symbol) (ver :: Symbol) pkgs =
+  CMakePackage pkgs
+
+instance (HasCmake pkgs, HasNinja pkgs, HasGcc pkgs)
+  => HasBuild (CMakePackage name ver pkgs) where
+  type BuildResult (CMakePackage name ver pkgs) = Derivation
+  build = cmakeConfigure name ver >> ninjaCompile >> ninjaInstall
+```
+
+Now derive package instances by stating which build pattern to use:
+
+```haskell
+-- "openssl is a cmake package"
+deriving via (CMakePackage "openssl" "3.1" pkgs)
+  instance (HasCmake pkgs, HasNinja pkgs, HasGcc pkgs) => HasOpenssl pkgs
+
+-- "json-c is a cmake package"
+deriving via (CMakePackage "json-c" "0.17" pkgs)
+  instance (HasCmake pkgs, HasNinja pkgs, HasGcc pkgs) => HasJsonC pkgs
+```
+
+Both packages get cmake-based builds without writing any build logic.
+The build pattern is defined once and reused.
+
+More build patterns:
+
+```haskell
+-- Autotools (./configure && make && make install)
+newtype AutotoolsPackage (name :: Symbol) (ver :: Symbol) pkgs =
+  AutotoolsPackage pkgs
+
+-- Rust/Cargo
+newtype CargoPackage (name :: Symbol) (ver :: Symbol) pkgs =
+  CargoPackage pkgs
+
+-- Python (pip/setuptools)
+newtype PythonPackage (name :: Symbol) (ver :: Symbol) pkgs =
+  PythonPackage pkgs
+
+-- Haskell (cabal)
+newtype CabalPackage (name :: Symbol) (ver :: Symbol) pkgs =
+  CabalPackage pkgs
+```
+
+```haskell
+deriving via (AutotoolsPackage "zlib" "1.3" pkgs)
+  instance HasGcc pkgs => HasZlib pkgs
+
+deriving via (CargoPackage "ripgrep" "14.1" pkgs)
+  instance HasCargo pkgs => HasRipgrep pkgs
+
+deriving via (PythonPackage "requests" "2.31" pkgs)
+  instance HasPython pkgs => HasRequests pkgs
+
+deriving via (CabalPackage "pandoc" "3.1" pkgs)
+  instance HasGhc pkgs => HasPandoc pkgs
+```
+
+Each `deriving via` line is a complete package definition. The build
+pattern encapsulates the configure/build/install logic; the `deriving`
+line says "this package follows that pattern." This is exactly how Nix's
+language-specific builders work — but the pattern matching is verified
+by the type checker.
+
+**Customization via associated types.** Build patterns can expose
+configuration knobs through associated types:
+
+```haskell
+class HasBuild a where
+  type BuildResult a :: *
+  type BuildFlags a :: [Symbol]
+  type BuildFlags a = '[]                  -- default: no extra flags
+  build :: BuildResult a
+```
+
+```haskell
+-- openssl with custom flags:
+newtype OpensslCustom pkgs = OpensslCustom pkgs
+
+instance HasBuild (OpensslCustom pkgs) where
+  type BuildResult (OpensslCustom pkgs) = Derivation
+  type BuildFlags (OpensslCustom pkgs) = '["no-ssl3", "no-weak-ssl-ciphers"]
+  build = cmakeBuild (flagsToArgs @(BuildFlags (OpensslCustom pkgs)))
+
+deriving via (OpensslCustom pkgs)
+  instance HasOpenssl pkgs
+```
+
+### 17.3 DeriveAnyClass: Default-Method Packages
+
+`DeriveAnyClass` generates an empty instance, relying entirely on default
+methods (§13). For packages where the class provides a complete default
+build recipe, just declare the instance:
+
+```haskell
+{-# LANGUAGE DeriveAnyClass #-}
+
+class HasZlib pkgs where
+  zlibSrc :: SourceTree
+  zlibSrc = fetchUrl "https://zlib.net/zlib-1.3.tar.gz"
+
+  zlib :: Derivation
+  zlib = standardBuild (zlibSrc @pkgs) []
+
+-- DeriveAnyClass: empty instance body, all defaults apply
+data Nixpkgs
+  deriving anyclass (HasZlib)
+```
+
+This is the simplest form of package definition — the class author wrote
+the build recipe, and the package set just opts in. It corresponds to
+packages in Nix where `callPackage ./pkg.nix {}` needs no overrides.
+
+**Bulk package set definition.** Combine `DeriveAnyClass` with multiple
+classes:
+
+```haskell
+data Nixpkgs
+  deriving anyclass
+    ( HasZlib, HasOpenssl, HasCurl, HasPython
+    , HasGit, HasNinja, HasCmake, HasPerl
+    -- ... every package with a complete default build
+    )
+```
+
+One `data` declaration + one `deriving` clause defines an entire package set.
+Packages that need customization get explicit instances; everything else
+uses defaults.
+
+### 17.4 StandaloneDeriving: Conditional Package Inclusion
+
+`StandaloneDeriving` separates the instance derivation from the type
+definition, enabling conditional package inclusion:
+
+```haskell
+{-# LANGUAGE StandaloneDeriving #-}
+
+data Nixpkgs
+
+-- Always available:
+deriving anyclass instance HasZlib Nixpkgs
+deriving anyclass instance HasOpenssl Nixpkgs
+
+-- Only on Linux:
+#ifdef linux_HOST_OS
+deriving anyclass instance HasSystemd Nixpkgs
+deriving anyclass instance HasInotify Nixpkgs
+#endif
+
+-- Only if LLVM backend is enabled:
+#ifdef ENABLE_LLVM
+deriving via (LLVMBackend Nixpkgs) instance HasGhc Nixpkgs
+#else
+deriving via (NCGBackend Nixpkgs)  instance HasGhc Nixpkgs
+#endif
+```
+
+This is compile-time conditional compilation of the package set — different
+build configurations produce different sets of available packages, all
+checked statically.
+
+### 17.5 Generic: Structure-Driven Build Recipes
+
+GHC's `Generic` class + `DefaultSignatures` enables a pattern where the
+build recipe is derived from the **structure** of the package description:
+
+```haskell
+{-# LANGUAGE DeriveGeneric, DefaultSignatures #-}
+
+class HasBuild a where
+  build :: Derivation
+  default build :: (Generic a, GBuildable (Rep a)) => Derivation
+  build = genericBuild (from (undefined :: a))
+```
+
+A package description is a plain data type:
+
+```haskell
+data OpensslPkg = OpensslPkg
+  { name    :: "openssl"
+  , version :: "3.1"
+  , src     :: Url "https://openssl.org/source/openssl-3.1.tar.gz"
+  , buildSystem :: CMake
+  , deps    :: (Zlib, Perl)
+  }
+  deriving (Generic, HasBuild)
+```
+
+The `Generic` representation tells the build system: "this package has a
+name, version, source URL, uses cmake, and depends on zlib and perl." The
+`genericBuild` function inspects this structure and produces the derivation
+automatically.
+
+This is the type-level analogue of Nix's `mkDerivation` — the function
+inspects its argument record and dispatches to the appropriate builder.
+But here, the "inspection" happens at compile time through `Generic`, and
+type mismatches (e.g., listing a nonexistent dependency) are caught statically.
+
+### 17.6 The Full Picture: Package Set as a Derived Type
+
+Combining all strategies, a complete package set looks like:
+
+```haskell
+-- The package set type
+newtype Nixpkgs = Nixpkgs ()
+  deriving anyclass
+    ( HasZlib           -- default build (§17.3)
+    , HasReadline       -- default build
+    , HasSqlite         -- default build
+    )
+
+-- Build-pattern-based packages (§17.2):
+deriving via (CMakePackage "openssl" "3.1" Nixpkgs)
+  instance HasOpenssl Nixpkgs
+
+deriving via (AutotoolsPackage "curl" "8.5" Nixpkgs)
+  instance HasCurl Nixpkgs
+
+deriving via (PythonPackage "requests" "2.31" Nixpkgs)
+  instance HasRequests Nixpkgs
+
+-- Hand-written instances for packages that need custom logic:
+instance HasGhc Nixpkgs where
+  ghc = complexBootstrappedBuild ...
+
+-- An overlay: inherits everything, overrides one package (§17.1):
+newtype SecurityPatch = SecurityPatch Nixpkgs
+  deriving ( HasZlib, HasReadline, HasSqlite, HasCurl
+           , HasRequests, HasGhc, ...
+           )
+
+deriving via (CMakePackage "openssl" "3.2" SecurityPatch)
+  instance HasOpenssl SecurityPatch   -- bumped
+```
+
+Three levels of automation:
+1. **`anyclass`** — packages with complete defaults (zero config)
+2. **`via`** — packages following a known build pattern (one line)
+3. **Hand-written** — packages with complex custom logic (full control)
+
+### 17.7 Comparison with Nix Builders
+
+| Deriving strategy | Nix equivalent |
+|---|---|
+| `DeriveAnyClass` | `callPackage ./pkg.nix {}` (no overrides) |
+| `DerivingVia CMakePackage` | `mkDerivation { buildSystem = cmake; }` |
+| `DerivingVia PythonPackage` | `buildPythonPackage { }` |
+| `DerivingVia CargoPackage` | `buildRustPackage { }` |
+| `GeneralizedNewtypeDeriving` | Overlay forwarding (`final: prev: { }`) |
+| `StandaloneDeriving` + CPP | Platform-conditional packages |
+| `Generic` + `DefaultSignatures` | `mkDerivation` inspecting `src`, `buildInputs` |
+
+The key difference: in Nix, these patterns are conventions — nothing prevents
+`buildPythonPackage` from being called on a C project. With `deriving`, the
+build pattern is **type-checked**: `DerivingVia PythonPackage` only works for
+types that structurally match what `PythonPackage` expects.
+
+
+## §18 Open Questions and Extensions
+
+### 18.1 Backtracking
 
 The current calculus commits to `select`'s choice. If resolution of the
 selected declaration's dependencies fails, the whole resolution fails. An
@@ -2692,7 +3043,7 @@ Possible approaches:
 Approach (3) is essentially what SAT-based package managers do, but the second
 phase (lazy building) is what our calculus adds beyond them.
 
-### 17.2 Quantified Constraints
+### 18.2 Quantified Constraints
 
 Haskell's `QuantifiedConstraints` extension allows:
 
@@ -2710,7 +3061,7 @@ This requires extending constraints with universal quantification, moving us
 from Horn clauses to hereditary Harrop formulas. The resolution algorithm
 becomes significantly more complex (essentially λProlog).
 
-### 17.3 Semantic Versioning as Type Change
+### 18.3 Semantic Versioning as Type Change
 
 A breaking change (major version bump) corresponds to a change in the
 "evidence type" — the package now provides a different interface. A minor
@@ -2723,7 +3074,7 @@ with structural subtyping on evidence:
 -- major bump:   C_new is incompatible with C_old
 ```
 
-### 17.4 Build-Time Configuration as Associated Types
+### 18.4 Build-Time Configuration as Associated Types
 
 A package parameterized by build configuration (e.g., Python with/without SSL)
 corresponds to a typeclass with **associated types**:
@@ -2737,7 +3088,7 @@ class Package p where
 In our calculus, this could be modeled by indexing evidence by a configuration
 parameter, making constraints richer.
 
-### 17.5 Proof Search Strategies
+### 18.5 Proof Search Strategies
 
 The current calculus uses depth-first resolution (like GHC). Alternatives:
 - Breadth-first (complete but slower)
