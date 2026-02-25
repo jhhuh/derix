@@ -7,7 +7,9 @@ or package set construction.
 
 This is a design space exploration — sections may present alternative or
 even contradictory encodings. See [`calculus.md`](calculus.md) for the
-formal resolution calculus that these encodings implement.
+formal resolution calculus that these encodings implement, and
+[`callpackage.md`](callpackage.md) for a ground-up redesign centered on
+`callPackage` as a first-class class method.
 
 ## §1 GHC Encodings: Piggybacking the Constraint Solver
 

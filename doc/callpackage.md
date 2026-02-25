@@ -1,0 +1,315 @@
+# Derix: The `callPackage` Encoding
+
+Starting from scratch. If `pkgs` is a type, what is `callPackage`?
+
+## §1 The Core Observation
+
+In Nix, a package recipe is a function:
+
+```nix
+# openssl.nix
+{ zlib, perl }: mkDerivation { ... buildInputs = [ zlib perl ]; ... }
+```
+
+`callPackage` fills the arguments from the package set:
+
+```nix
+pkgs.openssl = callPackage ./openssl.nix {}
+```
+
+In Haskell, if `pkgs` is a type representing the package set, the recipe
+has signature:
+
+```haskell
+openssl :: forall pkgs -> Derivation
+```
+
+But bare `forall pkgs ->` gives no access to the package set's contents.
+To reference other packages, you need **constraints** — the dependency
+declaration:
+
+```haskell
+openssl :: forall pkgs -> (Has "zlib" pkgs, Has "perl" pkgs) => Derivation
+```
+
+The Nix formal parameters `{ zlib, perl }` become Haskell constraints
+`(Has "zlib" pkgs, Has "perl" pkgs)`. Filling those parameters from the
+package set is **instance resolution**.
+
+So `callPackage` IS instance resolution. And the recipe IS a constrained
+polymorphic function over `pkgs`.
+
+## §2 The `Package` Class
+
+Since constraints vary per package, the recipe must be a class method.
+The class is indexed by the package name:
+
+```haskell
+class Package (name :: Symbol) where
+  type Deps name (pkgs :: Type) :: Constraint
+  callPackage :: forall pkgs -> Deps name pkgs => Derivation
+```
+
+- `name` identifies the package (type-level string)
+- `Deps` is an associated constraint family: given a package name and a
+  package set type, it returns the constraint that must be satisfied
+- `callPackage` takes a package set type (visible `forall`) and, given
+  the dependencies are met, produces a `Derivation`
+
+## §3 Package Definitions as Instances
+
+Each package is an instance of `Package`:
+
+```haskell
+instance Package "zlib" where
+  type Deps "zlib" pkgs = ()
+  callPackage @pkgs = mkDrv "zlib" "1.3" []
+
+instance Package "openssl" where
+  type Deps "openssl" pkgs = Has "zlib" pkgs
+  callPackage @pkgs = mkDrv "openssl" "3.1" [callPackage @"zlib" @pkgs]
+
+instance Package "curl" where
+  type Deps "curl" pkgs = (Has "openssl" pkgs, Has "zlib" pkgs)
+  callPackage @pkgs = mkDrv "curl" "8.5"
+    [callPackage @"openssl" @pkgs, callPackage @"zlib" @pkgs]
+
+instance Package "python" where
+  type Deps "python" pkgs = (Has "openssl" pkgs, Has "zlib" pkgs)
+  callPackage @pkgs = mkDrv "python" "3.12"
+    [callPackage @"openssl" @pkgs, callPackage @"zlib" @pkgs]
+```
+
+Note: `callPackage @"zlib" @pkgs` inside openssl's body calls
+`callPackage` from `Package "zlib"` at the same `pkgs` type. This
+requires `Has "zlib" pkgs`, which is exactly what `Deps "openssl" pkgs`
+provides.
+
+## §4 The `Has` Class: Package Set Membership
+
+`Package` defines recipes. A separate class records which packages are
+available in a given package set:
+
+```haskell
+class Package name => Has (name :: Symbol) (pkgs :: Type) where
+  -- possibly empty: mere membership witness
+```
+
+The superclass `Package name` ensures you can only claim membership for
+packages that have a recipe. An instance `Has "zlib" Nixpkgs` says
+"zlib is available in Nixpkgs."
+
+## §5 Package Set Construction
+
+A concrete package set declares which packages it contains:
+
+```haskell
+data Nixpkgs
+
+instance Has "zlib"    Nixpkgs
+instance Has "openssl" Nixpkgs
+instance Has "curl"    Nixpkgs
+instance Has "python"  Nixpkgs
+```
+
+Usage:
+
+```haskell
+main = print (callPackage @"python" @Nixpkgs)
+```
+
+GHC resolves `Deps "python" Nixpkgs = (Has "openssl" Nixpkgs, Has "zlib" Nixpkgs)`,
+finds both instances, and proceeds. Inside the body, `callPackage @"openssl" @Nixpkgs`
+triggers resolution of `Deps "openssl" Nixpkgs = Has "zlib" Nixpkgs`, also found.
+
+If you declare `Has "curl" Nixpkgs` but not `Has "openssl" Nixpkgs`,
+GHC reports: `No instance for Has "openssl" Nixpkgs` — unsatisfied
+dependency, caught at compile time.
+
+## §6 Separation of Concerns
+
+The encoding separates three things:
+
+| Concept | Mechanism | Nix analogue |
+|---|---|---|
+| Recipe | `Package` instance | `.nix` file |
+| Dependencies | `Deps` associated constraint | Function formal params |
+| Package set | `Has` instances for a type | `callPackage` wiring in `all-packages.nix` |
+
+A recipe is defined once (one `Package` instance per package name) and
+is package-set-independent. A package set chooses which recipes to
+include by declaring `Has` instances. This mirrors Nix's separation
+between `pkgs/by-name/` (recipes) and `all-packages.nix` (wiring).
+
+## §7 Resolution Flow
+
+When GHC evaluates `callPackage @"python" @Nixpkgs`:
+
+```
+callPackage @"python" @Nixpkgs
+  requires: Deps "python" Nixpkgs
+          = (Has "openssl" Nixpkgs, Has "zlib" Nixpkgs)
+  ✓ Has "openssl" Nixpkgs — declared
+  ✓ Has "zlib" Nixpkgs — declared
+  body calls:
+    callPackage @"openssl" @Nixpkgs
+      requires: Deps "openssl" Nixpkgs = Has "zlib" Nixpkgs
+      ✓ Has "zlib" Nixpkgs — declared
+      body calls:
+        callPackage @"zlib" @Nixpkgs
+          requires: Deps "zlib" Nixpkgs = ()
+          ✓ trivially satisfied
+          → mkDrv "zlib" "1.3" []
+      → mkDrv "openssl" "3.1" [<zlib>]
+    callPackage @"zlib" @Nixpkgs
+      → (shared: same dictionary as above)
+  → mkDrv "python" "3.12" [<openssl>, <zlib>]
+```
+
+Sharing: `callPackage @"zlib" @Nixpkgs` produces one dictionary, reused
+by both openssl and python.
+
+## §8 What This Buys
+
+**`callPackage` is a first-class concept.** In the multi-class encoding
+(encoding §1), `callPackage` is implicit — it's the act of writing an
+instance. Here, it's an actual method you can call, with a uniform
+signature across all packages.
+
+**Recipes are package-set-independent.** The `Package` instance for
+openssl doesn't mention `Nixpkgs`. It works for any `pkgs` that
+satisfies `Has "zlib" pkgs`. This is exactly how Nix recipes are
+written — they don't know which package set will call them.
+
+**The package set is just a list of `Has` assertions.** No method
+bodies, no build logic — just declarations of what's available. The
+recipes are elsewhere. This mirrors `all-packages.nix` being mostly
+`callPackage` invocations with no build logic.
+
+**Dependencies are inspectable at the type level.** `Deps "openssl" pkgs`
+is a type family you can reduce, query, and compose. "What does openssl
+need?" is a type-level question with a type-level answer.
+
+## §9 What This Costs
+
+**No per-package superclass.** There is one `Package` class, so there
+is one superclass context (namely `Package name => Has name pkgs`). You
+cannot express "anything that has openssl automatically has zlib" — that
+requires a per-package class declaration with per-package superclass.
+Propagated dependencies (encoding §2) are lost.
+
+**No per-package methods.** The class has one method (`callPackage`)
+returning `Derivation`. Multiple outputs, typed interfaces, version
+accessors — these need additional machinery (associated types on
+`Package`, or a richer return type).
+
+**Overlays require separate design.** With one class and `Symbol`
+indexing, you cannot have two `Package "openssl"` instances (different
+versions). Overlays need a different mechanism — perhaps a `pkgs`-indexed
+version of `Package`, or a separate overlay algebra.
+
+These are acknowledged trade-offs. This document focuses on the
+`callPackage` core; extensions can recover the lost features.
+
+## §10 Comparison with Nix
+
+```
+Nix                              Haskell (this encoding)
+──────────────────────────────── ────────────────────────────────
+{ zlib, perl }:                  type Deps "openssl" pkgs =
+  mkDerivation { ... }             (Has "zlib" pkgs, Has "perl" pkgs)
+                                 callPackage @pkgs = mkDrv ...
+
+callPackage ./openssl.nix {}     callPackage @"openssl" @Nixpkgs
+
+pkgs = self: { ... }             data Nixpkgs
+                                 instance Has "zlib" Nixpkgs
+                                 instance Has "openssl" Nixpkgs
+                                 ...
+
+builtins.functionArgs            Deps "openssl" pkgs
+                                 (type family, inspectable)
+
+missing argument error           No instance for Has "foo" Nixpkgs
+(at eval time)                   (at compile time)
+```
+
+The structural correspondence: Nix's dynamic function argument
+inspection becomes Haskell's static constraint resolution. What Nix
+checks at evaluation time, GHC checks at compile time.
+
+## §11 Extensions (Sketches)
+
+### 11.1 Multiple Outputs
+
+```haskell
+class Package (name :: Symbol) where
+  type Deps name pkgs :: Constraint
+  type Output name :: Type                  -- NEW
+  type Output name = Derivation             -- default
+  callPackage :: forall pkgs -> Deps name pkgs => Output name
+
+instance Package "openssl" where
+  type Deps "openssl" pkgs = Has "zlib" pkgs
+  type Output "openssl" = OpensslOutputs    -- lib, dev, doc
+  callPackage @pkgs = OpensslOutputs { ... }
+```
+
+### 11.2 Version Information
+
+```haskell
+class Package (name :: Symbol) where
+  type Deps name pkgs :: Constraint
+  type Ver name :: Version                  -- NEW
+  callPackage :: forall pkgs -> Deps name pkgs => Derivation
+
+instance Package "openssl" where
+  type Ver "openssl" = 'V 3 1 0
+  ...
+```
+
+Version predicates in `Deps`:
+
+```haskell
+instance Package "curl" where
+  type Deps "curl" pkgs =
+    ( Has "openssl" pkgs
+    , Requires (Ver "openssl") ('AtLeast ('V 3 0 0))
+    , Has "zlib" pkgs
+    )
+  ...
+```
+
+### 11.3 Propagated Dependencies
+
+Without per-package superclass, propagation can be encoded via a
+type family:
+
+```haskell
+type family Propagated (name :: Symbol) (pkgs :: Type) :: Constraint
+type instance Propagated "openssl" pkgs = Has "zlib" pkgs
+type instance Propagated "curl" pkgs =
+  (Has "openssl" pkgs, Propagated "openssl" pkgs)
+```
+
+A consumer of openssl gets zlib by including `Propagated "openssl" pkgs`
+in their constraint. This is explicit (not automatic like superclass)
+but composes.
+
+### 11.4 Minimal Package Sets
+
+```haskell
+-- Only include what's needed. GHC tells you what's missing.
+data Minimal
+
+instance Has "zlib" Minimal
+-- instance Has "openssl" Minimal  -- omitted
+
+-- callPackage @"openssl" @Minimal
+-- ERROR: No instance for Has "zlib" Minimal
+-- Wait — zlib IS there. Let's try:
+
+-- callPackage @"curl" @Minimal
+-- ERROR: No instance for Has "openssl" Minimal
+-- Tells you exactly what's missing.
+```
