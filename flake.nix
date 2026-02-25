@@ -10,24 +10,12 @@
     flake-utils.lib.eachDefaultSystem (system:
       let
         pkgs = nixpkgs.legacyPackages.${system};
-        ghc = pkgs.haskellPackages.ghcWithPackages (hp: with hp; [
-          containers
-          text
-          mtl
-          prettyprinter
-        ]);
       in
       {
         devShells.default = pkgs.mkShell {
           buildInputs = with pkgs; [
-            # Process management
             overmind
             tmux
-
-            # Haskell
-            ghc
-            cabal-install
-            haskellPackages.haskell-language-server
           ];
         };
       });

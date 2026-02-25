@@ -12,26 +12,27 @@ Package resolution is **proof search in a lazy evidence environment**. A resolve
 package set (nixpkgs) and a resolved dictionary environment (GHC) are both **lazy
 fixed points** of a self-referential record of evidence thunks.
 
-The calculus operates at the **evidence level**: constraints are "types", evidence
-terms (derivations / dictionaries) are "terms", resolution is proof search.
+The design piggybacks on GHC's own typeclass resolution — no separate resolver
+implementation needed. GHC IS the package resolver.
 
-## Key Document
+## Key Documents
 
-- `doc/calculus.md` — the formal calculus (syntax, rules, semantics, metatheory)
+- `doc/encoding.md` — the concrete GHC encoding (primary design doc)
+- `doc/calculus.md` — formal resolution calculus
+- `doc/design-space.md` — survey of GHC features mapped to package management
 
 ## Project Structure
 
 ```
 doc/                — formal documents
-  calculus.md       — the Derix calculus specification
+  encoding.md       — the callPackage encoding (primary)
+  calculus.md       — formal calculus specification
+  design-space.md   — GHC encoding design space survey
 artifacts/          — plans, devlog, skill files
   devlog.md         — append-only decision journal
   skills/           — reusable patterns discovered during work
-src/                — Haskell prototype (Lean formalization later)
-  Resolve/          — core modules: Syntax, Resolve, Fix, Overlay, Coherence, Pretty
-  Main.hs           — worked examples demonstrating the calculus
 ```
 
 ## Status
 
-Formal calculus designed. Haskell prototype working (builds, runs examples).
+Design documents only. No implementation — GHC's typeclass machinery is the implementation.
