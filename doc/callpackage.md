@@ -90,7 +90,7 @@ The class is indexed by the package name:
 class Package (name :: Symbol) where
   type Deps name (pkgs :: Type) :: Constraint
   type Output name :: Type
-  type Output name = Derivation              -- default for normal packages
+  type Output name = AnyDerivation            -- default for normal packages
   callPackage :: forall pkgs -> Deps name pkgs => Output name
 ```
 
@@ -98,12 +98,44 @@ class Package (name :: Symbol) where
 - `Deps` is an associated constraint family: given a package name and a
   package set type, it returns the constraint that must be satisfied
 - `Output` is the type of what the package produces. Defaults to
-  `Derivation`, but can be anything — a function, a record, a path.
-  This makes the package set **heterogeneous**: fetchers return
-  functions, packages return derivations, utilities return whatever
-  they are
+  `AnyDerivation` (see below), but can be anything — a function, a
+  record, a path. This makes the package set **heterogeneous**: fetchers
+  return functions, packages return derivations, utilities return
+  whatever they are
 - `callPackage` takes a package set type (visible `forall`) and, given
   the dependencies are met, produces `Output name`
+
+### 2.1 `HasDerivation` and `AnyDerivation`
+
+Not every package output is a bare `Derivation`, but most can produce
+one. The `HasDerivation` class captures this:
+
+```haskell
+class HasDerivation a where
+  toDerivation :: a -> Derivation
+
+instance HasDerivation Derivation where
+  toDerivation = id
+```
+
+The default `Output` is an existentially quantified wrapper — any type
+that knows how to produce a `Derivation`:
+
+```haskell
+data AnyDerivation = forall a. HasDerivation a => MkAnyDerivation a
+
+instance HasDerivation AnyDerivation where
+  toDerivation (MkAnyDerivation x) = toDerivation x
+```
+
+A package returning `AnyDerivation` can internally carry any rich type
+(with version info, multiple outputs, metadata) while presenting a
+uniform interface. Consumers that need a `Derivation` call
+`toDerivation`. Consumers that know the concrete type (via `Pkg`, see
+§11.5) can access the richer structure.
+
+Infrastructure like stdenv and fetchers override `Output` with specific
+types (functions). Normal packages use the default `AnyDerivation`.
 
 ## §3 Package Definitions as Instances
 
@@ -136,17 +168,19 @@ and other bootstrap tools. Same here:
 ```haskell
 instance Package "stdenv" where
   type Deps "stdenv" pkgs = (Has "gcc" pkgs, Has "coreutils" pkgs, Has "bash" pkgs)
-  type Output "stdenv" = MkDerivationArgs -> Derivation
+  type Output "stdenv" = MkDerivationArgs -> AnyDerivation
   callPackage @pkgs = \args ->
     let gcc       = callPackage @"gcc" @pkgs
         coreutils = callPackage @"coreutils" @pkgs
         bash      = callPackage @"bash" @pkgs
-    in buildWithStdenv gcc coreutils bash args
+    in MkAnyDerivation $ buildWithStdenv gcc coreutils bash args
 ```
 
-`Output "stdenv"` is `MkDerivationArgs -> Derivation` — a builder
-function, not a derivation. `mkDerivation` is no longer a magic
-top-level function; it's resolved from `pkgs` like everything else.
+`Output "stdenv"` is `MkDerivationArgs -> AnyDerivation` — a builder
+function, not a derivation. The `MkAnyDerivation` wrapping happens
+once here; every package that uses `mkDerivation` gets `AnyDerivation`
+for free. `mkDerivation` is no longer a magic top-level function; it's
+resolved from `pkgs` like everything else.
 
 The package set is heterogeneous — each entry has its own type, determined
 by `Output`.
@@ -156,8 +190,10 @@ requires `Has "curl" pkgs`. Same dependency, statically checked.
 
 ### 3.2 Normal Packages
 
-Normal packages use the default `Output` (= `Derivation`) and pull
-`mkDerivation` from `stdenv` in the same package set:
+Normal packages use the default `Output` (= `AnyDerivation`). Since
+`mkDerivation` from stdenv already returns `AnyDerivation`, the types
+line up directly. Dependencies in `buildInputs` go through
+`toDerivation`:
 
 ```haskell
 instance Package "zlib" where
@@ -181,7 +217,7 @@ instance Package "openssl" where
       , src = (callPackage @"fetchurl" @pkgs)
           "https://openssl.org/source/openssl-3.1.tar.gz"
           "sha256-def..."
-      , buildInputs = [callPackage @"zlib" @pkgs]
+      , buildInputs = [toDerivation $ callPackage @"zlib" @pkgs]
       }
 
 instance Package "curl" where
@@ -195,8 +231,8 @@ instance Package "curl" where
           "https://curl.se/download/curl-8.5.tar.gz"
           "sha256-ghi..."
       , buildInputs =
-          [ callPackage @"openssl" @pkgs
-          , callPackage @"zlib" @pkgs
+          [ toDerivation $ callPackage @"openssl" @pkgs
+          , toDerivation $ callPackage @"zlib" @pkgs
           ]
       }
 ```
@@ -489,6 +525,9 @@ instance Has "zlib" Minimal
 
 ### 11.5 Per-Package Data Types (`Pkg` Data Family)
 
+The core spec is `Package`, `Has`, and `HasDerivation`/`AnyDerivation`.
+Everything below is a suggested ergonomic pattern, not part of the spec.
+
 In Nix, `{ openssl, zlib, perl }:` binds named variables. In this
 encoding, you write `callPackage @"openssl" @pkgs` everywhere — verbose,
 and no structured access to package-specific metadata (headers path,
@@ -510,20 +549,39 @@ data instance Pkg "openssl" = Openssl
   }
 ```
 
-A separate class constructs the record from the resolved package:
+A suggested helper class constructs the record. `pkgMeta` takes the
+`callPackage` result as input — so `Pkg` captures both the **output**
+(the derivation itself) and **input-side** metadata (version, paths,
+configuration):
 
 ```haskell
 class Package name => HasPkg (name :: Symbol) where
-  pkgMeta :: forall pkgs -> Has name pkgs => Pkg name
+  pkgMeta :: forall pkgs -> Has name pkgs => Output name -> Pkg name
+```
 
+The output of `callPackage` flows into `pkgMeta`, which enriches it:
+
+```haskell
 instance HasPkg "openssl" where
-  pkgMeta @pkgs =
-    let drv = callPackage @"openssl" @pkgs
+  pkgMeta @pkgs output =
+    let drv = toDerivation output
     in Openssl
       { opensslDrv     = drv
       , opensslHeaders = drvOutPath drv <> "/include"
       , opensslVersion = "3.1"
       }
+```
+
+`pkgMeta` receives the `AnyDerivation` from `callPackage`, extracts
+the `Derivation` via `toDerivation`, and bundles it with metadata.
+The `Pkg` record has both: the build result (output info) and version,
+paths, flags (input info).
+
+`Pkg` instances are themselves `HasDerivation`, closing the loop:
+
+```haskell
+instance HasDerivation (Pkg "openssl") where
+  toDerivation = opensslDrv
 ```
 
 The biggest payoff: `stdenv` itself gets a `Pkg` instance. Since almost
@@ -532,36 +590,34 @@ RecordWildCards brings it into scope automatically:
 
 ```haskell
 data instance Pkg "stdenv" = Stdenv
-  { mkDerivation :: MkDerivationArgs -> Derivation
+  { mkDerivation :: MkDerivationArgs -> AnyDerivation
   , cc           :: StorePath
   }
 
 instance HasPkg "stdenv" where
-  pkgMeta @pkgs =
-    let build = callPackage @"stdenv" @pkgs
-    in Stdenv
-      { mkDerivation = build
-      , cc = drvOutPath (callPackage @"gcc" @pkgs) <> "/bin/gcc"
-      }
+  pkgMeta @pkgs build = Stdenv
+    { mkDerivation = build
+    , cc = drvOutPath (toDerivation $ callPackage @"gcc" @pkgs) <> "/bin/gcc"
+    }
 ```
 
-Now recipe bodies become concise — `mkDerivation` appears as if it
-were a local function, but it's resolved from `pkgs`:
+Now recipe bodies become concise — destructure dependencies with
+RecordWildCards, and `mkDerivation` appears as a local function:
 
 ```haskell
 instance Package "curl" where
   type Deps "curl" pkgs =
     (Has "stdenv" pkgs, Has "openssl" pkgs, Has "zlib" pkgs, Has "fetchurl" pkgs)
   callPackage @pkgs =
-    let Stdenv{..}  = pkgMeta @"stdenv" @pkgs
-        Openssl{..} = pkgMeta @"openssl" @pkgs
+    let Stdenv{..}  = pkgMeta @"stdenv"  @pkgs (callPackage @"stdenv" @pkgs)
+        Openssl{..} = pkgMeta @"openssl" @pkgs (callPackage @"openssl" @pkgs)
     -- mkDerivation, cc, opensslDrv, opensslHeaders, opensslVersion in scope
     in mkDerivation MkDerivationArgs
       { name = "curl", version = "8.5"
       , src = (callPackage @"fetchurl" @pkgs)
           "https://curl.se/download/curl-8.5.tar.gz"
           "sha256-ghi..."
-      , buildInputs = [opensslDrv, callPackage @"zlib" @pkgs]
+      , buildInputs = [opensslDrv, toDerivation $ callPackage @"zlib" @pkgs]
       , configureFlags =
           ["--with-ssl-headers=" <> opensslHeaders]
       }
@@ -577,10 +633,13 @@ Key properties:
 - **Optional.** Packages without a `Pkg` instance are used via
   `callPackage` directly. The data family is open — define instances
   only when the ergonomics matter.
-- **Not the `Output`.** `callPackage @"openssl"` still returns
-  `Derivation` (or whatever `Output "openssl"` is). `Pkg "openssl"`
-  is a convenience wrapper constructed from the output, not a
-  replacement for it.
+- **Both input and output.** `pkgMeta` takes the `callPackage` result
+  (output info) and enriches it with metadata (input info). The `Pkg`
+  record captures both sides of the build process.
+- **`HasDerivation` bridge.** `Pkg` instances implement `HasDerivation`,
+  so they can flow into `buildInputs` via `toDerivation`. A `Pkg`
+  value carries rich structure but can always be projected to a
+  `Derivation`.
 - **Proof-carrying.** A value of type `Pkg "openssl"` witnesses that
   openssl was resolved. The constructor name `Openssl` can be used
   in pattern matching to make the provenance of each field explicit.
