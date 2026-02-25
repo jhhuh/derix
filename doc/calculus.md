@@ -2,7 +2,7 @@
 
 A pen-and-paper resolution calculus where package resolution IS
 typeclass instance resolution. The concrete GHC encoding is in
-[`callpackage.md`](callpackage.md). This document provides the formal
+[`encoding.md`](encoding.md). This document provides the formal
 foundation.
 
 ## §1 The Correspondence

@@ -16,7 +16,7 @@ generation) — all the same object, in the N**ix** ecosystem.
 
 ## The Encoding
 
-The current design is in [`doc/callpackage.md`](doc/callpackage.md).
+The current design is in [`doc/encoding.md`](doc/encoding.md).
 
 `callPackage` is a class method. `pkgs` is a phantom type. Dependencies
 are constraints. Instance resolution IS dependency resolution.
@@ -54,8 +54,8 @@ missing argument error           No instance for Has "foo" Nixpkgs
 - [`doc/calculus.md`](doc/calculus.md) — formal resolution calculus
   (syntax, inference rules, call-by-need semantics, lazy fixed points,
   overlays, coherence, metatheory)
-- [`doc/encoding.md`](doc/encoding.md) — survey of GHC features mapped
-  to package management concepts
+- [`doc/design-space.md`](doc/design-space.md) — survey of GHC features
+  mapped to package management concepts
 
 ## Status
 
