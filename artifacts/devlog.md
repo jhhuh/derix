@@ -118,3 +118,54 @@ truly isomorphic, you can literally use one as the other. The compilation would 
 Tricky parts: version predicates need type-level comparison (type families),
 selection policies need OVERLAPPING pragmas or closed type families. But the
 basic architecture maps directly. This could be a concrete next milestone.
+
+## 2026-02-25 — The `callPackage` encoding (doc/encoding.md)
+
+**Core encoding designed**: `doc/callpackage.md` (later renamed `doc/encoding.md`).
+The encoding piggybacks directly on GHC's typeclass machinery — no separate
+resolver needed.
+
+Key design elements:
+
+- `Package (name :: Symbol)` class with associated `Deps`, `Output`, `callPackage`
+- Visible `forall pkgs ->` makes the package set a first-class type argument
+- `Has name pkgs` class for package set membership witness
+- `Deps` is an associated constraint family returning `Constraint`
+- `Output` is an associated type family — heterogeneous package sets (fetchers
+  return functions, stdenv returns `MkDerivationArgs -> Drv`, packages return
+  `Derivation name`)
+
+**Type evolution** (multiple iterations in one session):
+
+1. Started with `Derivation` as a raw struct + `AnyDerivation` existential
+2. Added `Drv name` phantom-tagged derivations to prevent accidental swaps
+3. Merged phantom tag with existential: `Derivation name = forall a. HasDrv a => Derivation a`
+4. **Final naming**: `Drv` = raw `.drv` store derivation (ATerm format, what
+   nix-daemon builds). `Derivation name` = existential + phantom-tagged wrapper
+   (rich type, carries extra info, compile-time safety)
+
+**stdenv as Package**: `Output "stdenv" = MkDerivationArgs -> Drv`. mkDerivation
+is no longer a magic top-level function — it's resolved from `pkgs` like everything
+else.
+
+**`Pkg` data family** (§11.5, ergonomic pattern, not core spec):
+- Open data family for per-package record types
+- `HasPkg` class with `pkgMeta :: forall pkgs -> Has name pkgs => Output name -> Pkg name`
+- Takes `callPackage` result as input — captures both input and output info
+- RecordWildCards brings `mkDerivation`, `headers`, `version` etc. into scope
+- Self-referential `pkgMeta` via recursive `let`
+- DuplicateRecordFields for plain field names
+
+## 2026-02-25 — Document cleanup and restructuring
+
+**Minimized docs**: calculus.md (931 → 128 lines), old encoding.md (3731 → 80 lines).
+Kept only the essential formal content.
+
+**File renames**:
+- `doc/callpackage.md` → `doc/encoding.md` (primary design doc)
+- old `doc/encoding.md` → `doc/design-space.md` (GHC feature survey)
+
+**Removed term-level resolver implementation**: Deleted `src/`, `derix.cabal`,
+and Haskell build deps from `flake.nix`. GHC's typeclass machinery IS the
+resolver — a separate implementation is the wrong approach. The project is
+design documents only.
