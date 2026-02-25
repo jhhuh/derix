@@ -109,8 +109,9 @@ class Package (name :: Symbol) where
 
 ### 3.1 Fetchers and Utilities
 
-Not everything in the package set is a derivation. Fetchers are
-**functions** that live in `pkgs` and depend on other packages:
+Not everything in the package set is a derivation. Infrastructure —
+fetchers, `stdenv`, build utilities — are **functions or records** that
+live in `pkgs` and depend on other packages:
 
 ```haskell
 instance Package "fetchurl" where
@@ -128,7 +129,25 @@ instance Package "fetchFromGitHub" where
     in fetchGitHubWith fetch git args
 ```
 
-`Output "fetchurl"` is `Text -> Text -> Derivation`, not `Derivation`.
+`stdenv` provides `mkDerivation`. In nixpkgs, `stdenv.mkDerivation` is
+how most packages are built — it depends on a C compiler, coreutils,
+and other bootstrap tools. Same here:
+
+```haskell
+instance Package "stdenv" where
+  type Deps "stdenv" pkgs = (Has "gcc" pkgs, Has "coreutils" pkgs, Has "bash" pkgs)
+  type Output "stdenv" = MkDerivationArgs -> Derivation
+  callPackage @pkgs = \args ->
+    let gcc       = callPackage @"gcc" @pkgs
+        coreutils = callPackage @"coreutils" @pkgs
+        bash      = callPackage @"bash" @pkgs
+    in buildWithStdenv gcc coreutils bash args
+```
+
+`Output "stdenv"` is `MkDerivationArgs -> Derivation` — a builder
+function, not a derivation. `mkDerivation` is no longer a magic
+top-level function; it's resolved from `pkgs` like everything else.
+
 The package set is heterogeneous — each entry has its own type, determined
 by `Output`.
 
@@ -137,42 +156,49 @@ requires `Has "curl" pkgs`. Same dependency, statically checked.
 
 ### 3.2 Normal Packages
 
-Normal packages use the default `Output` (= `Derivation`) and reference
-fetchers from the same package set:
+Normal packages use the default `Output` (= `Derivation`) and pull
+`mkDerivation` from `stdenv` in the same package set:
 
 ```haskell
 instance Package "zlib" where
-  type Deps "zlib" pkgs = Has "fetchurl" pkgs
-  callPackage @pkgs = mkDerivation MkDerivationArgs
-    { name = "zlib", version = "1.3"
-    , src = (callPackage @"fetchurl" @pkgs)
-        "https://zlib.net/zlib-1.3.tar.gz"
-        "sha256-abc..."
-    , buildInputs = []
-    }
+  type Deps "zlib" pkgs = (Has "stdenv" pkgs, Has "fetchurl" pkgs)
+  callPackage @pkgs =
+    let mkDerivation = callPackage @"stdenv" @pkgs
+    in mkDerivation MkDerivationArgs
+      { name = "zlib", version = "1.3"
+      , src = (callPackage @"fetchurl" @pkgs)
+          "https://zlib.net/zlib-1.3.tar.gz"
+          "sha256-abc..."
+      , buildInputs = []
+      }
 
 instance Package "openssl" where
-  type Deps "openssl" pkgs = (Has "zlib" pkgs, Has "fetchurl" pkgs)
-  callPackage @pkgs = mkDerivation MkDerivationArgs
-    { name = "openssl", version = "3.1"
-    , src = (callPackage @"fetchurl" @pkgs)
-        "https://openssl.org/source/openssl-3.1.tar.gz"
-        "sha256-def..."
-    , buildInputs = [callPackage @"zlib" @pkgs]
-    }
+  type Deps "openssl" pkgs = (Has "stdenv" pkgs, Has "zlib" pkgs, Has "fetchurl" pkgs)
+  callPackage @pkgs =
+    let mkDerivation = callPackage @"stdenv" @pkgs
+    in mkDerivation MkDerivationArgs
+      { name = "openssl", version = "3.1"
+      , src = (callPackage @"fetchurl" @pkgs)
+          "https://openssl.org/source/openssl-3.1.tar.gz"
+          "sha256-def..."
+      , buildInputs = [callPackage @"zlib" @pkgs]
+      }
 
 instance Package "curl" where
-  type Deps "curl" pkgs = (Has "openssl" pkgs, Has "zlib" pkgs, Has "fetchurl" pkgs)
-  callPackage @pkgs = mkDerivation MkDerivationArgs
-    { name = "curl", version = "8.5"
-    , src = (callPackage @"fetchurl" @pkgs)
-        "https://curl.se/download/curl-8.5.tar.gz"
-        "sha256-ghi..."
-    , buildInputs =
-        [ callPackage @"openssl" @pkgs
-        , callPackage @"zlib" @pkgs
-        ]
-    }
+  type Deps "curl" pkgs =
+    (Has "stdenv" pkgs, Has "openssl" pkgs, Has "zlib" pkgs, Has "fetchurl" pkgs)
+  callPackage @pkgs =
+    let mkDerivation = callPackage @"stdenv" @pkgs
+    in mkDerivation MkDerivationArgs
+      { name = "curl", version = "8.5"
+      , src = (callPackage @"fetchurl" @pkgs)
+          "https://curl.se/download/curl-8.5.tar.gz"
+          "sha256-ghi..."
+      , buildInputs =
+          [ callPackage @"openssl" @pkgs
+          , callPackage @"zlib" @pkgs
+          ]
+      }
 ```
 
 `callPackage @"fetchurl" @pkgs` returns a function (not a derivation).
@@ -219,7 +245,11 @@ packages and fetchers:
 ```haskell
 data Nixpkgs
 
--- Infrastructure (fetchers, utilities)
+-- Infrastructure (stdenv, fetchers, utilities)
+instance Has "stdenv"          Nixpkgs
+instance Has "gcc"             Nixpkgs
+instance Has "coreutils"       Nixpkgs
+instance Has "bash"            Nixpkgs
 instance Has "curl"            Nixpkgs
 instance Has "git"             Nixpkgs
 instance Has "fetchurl"        Nixpkgs
@@ -341,16 +371,22 @@ These are acknowledged trade-offs. This document focuses on the
 ```
 Nix                              Haskell (this encoding)
 ──────────────────────────────── ────────────────────────────────
-{ zlib, perl }:                  type Deps "openssl" pkgs =
-  mkDerivation { ... }             (Has "zlib" pkgs, Has "perl" pkgs)
-                                 callPackage @pkgs = mkDerivation ...
+{ stdenv, zlib, perl }:          type Deps "openssl" pkgs =
+  stdenv.mkDerivation { ... }      (Has "stdenv" pkgs, Has "zlib" pkgs, ...)
+                                 callPackage @pkgs =
+                                   let mk = callPackage @"stdenv" @pkgs
+                                   in mk MkDerivationArgs { ... }
 
 callPackage ./openssl.nix {}     callPackage @"openssl" @Nixpkgs
 
 pkgs = self: { ... }             data Nixpkgs
+                                 instance Has "stdenv" Nixpkgs
                                  instance Has "zlib" Nixpkgs
                                  instance Has "fetchurl" Nixpkgs
                                  ...
+
+pkgs.stdenv.mkDerivation         callPackage @"stdenv" @Nixpkgs
+  (a function, not a drv)          :: MkDerivationArgs -> Derivation
 
 pkgs.fetchurl                    callPackage @"fetchurl" @Nixpkgs
   (a function, not a drv)          :: Text -> Text -> Derivation
@@ -490,15 +526,36 @@ instance HasPkg "openssl" where
       }
 ```
 
-The payoff is `RecordWildCards` in recipe bodies:
+The biggest payoff: `stdenv` itself gets a `Pkg` instance. Since almost
+every package needs `mkDerivation`, putting it in the `Pkg` record means
+RecordWildCards brings it into scope automatically:
+
+```haskell
+data instance Pkg "stdenv" = Stdenv
+  { mkDerivation :: MkDerivationArgs -> Derivation
+  , cc           :: StorePath
+  }
+
+instance HasPkg "stdenv" where
+  pkgMeta @pkgs =
+    let build = callPackage @"stdenv" @pkgs
+    in Stdenv
+      { mkDerivation = build
+      , cc = drvOutPath (callPackage @"gcc" @pkgs) <> "/bin/gcc"
+      }
+```
+
+Now recipe bodies become concise — `mkDerivation` appears as if it
+were a local function, but it's resolved from `pkgs`:
 
 ```haskell
 instance Package "curl" where
   type Deps "curl" pkgs =
-    (Has "openssl" pkgs, Has "zlib" pkgs, Has "fetchurl" pkgs)
+    (Has "stdenv" pkgs, Has "openssl" pkgs, Has "zlib" pkgs, Has "fetchurl" pkgs)
   callPackage @pkgs =
-    let Openssl{..} = pkgMeta @"openssl" @pkgs
-    -- opensslDrv, opensslHeaders, opensslVersion now in scope
+    let Stdenv{..}  = pkgMeta @"stdenv" @pkgs
+        Openssl{..} = pkgMeta @"openssl" @pkgs
+    -- mkDerivation, cc, opensslDrv, opensslHeaders, opensslVersion in scope
     in mkDerivation MkDerivationArgs
       { name = "curl", version = "8.5"
       , src = (callPackage @"fetchurl" @pkgs)
@@ -509,6 +566,11 @@ instance Package "curl" where
           ["--with-ssl-headers=" <> opensslHeaders]
       }
 ```
+
+Compare with the non-`Pkg` version from §3.2, where every dependency
+is `callPackage @"..." @pkgs` and `mkDerivation` must be explicitly
+bound from stdenv. The `Pkg` pattern recovers the feel of Nix's
+`{ stdenv, openssl, zlib, fetchurl }:` destructuring.
 
 Key properties:
 
