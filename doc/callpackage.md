@@ -646,3 +646,75 @@ Key properties:
 - **Namespaced fields.** By convention, field names are prefixed with
   the package name (`opensslHeaders`, not `headers`). With
   `RecordWildCards`, these come into scope without clashing.
+
+### 11.6 Phantom-Tagged Derivations
+
+A bare `Derivation` is untyped — nothing stops you from passing a gcc
+derivation where zlib is expected. A phantom type tags derivations with
+their package name:
+
+```haskell
+newtype Drv (name :: Symbol) = Drv { unDrv :: Derivation }
+
+instance HasDerivation (Drv name) where
+  toDerivation = unDrv
+```
+
+If the default `Output` is `Drv name` instead of `AnyDerivation`:
+
+```haskell
+class Package (name :: Symbol) where
+  type Deps name (pkgs :: Type) :: Constraint
+  type Output name :: Type
+  type Output name = Drv name               -- phantom-tagged by default
+  callPackage :: forall pkgs -> Deps name pkgs => Output name
+```
+
+then `callPackage @"zlib" @pkgs :: Drv "zlib"` and
+`callPackage @"openssl" @pkgs :: Drv "openssl"` are distinct types.
+Swapping them is a compile error:
+
+```haskell
+-- Type error: expected Drv "openssl", got Drv "zlib"
+configure :: Drv "openssl" -> Drv "zlib" -> IO ()
+configure openssl zlib = ...
+
+bad = configure (callPackage @"zlib" @pkgs) (callPackage @"openssl" @pkgs)
+--               ^^^^^^^^^^^^^^^^^^^^^^^^^ Drv "zlib" ≠ Drv "openssl"
+```
+
+The tag is erased when entering `buildInputs` via `toDerivation`:
+
+```haskell
+buildInputs =
+  [ toDerivation $ callPackage @"openssl" @pkgs  -- Drv "openssl" → Derivation
+  , toDerivation $ callPackage @"zlib" @pkgs     -- Drv "zlib"    → Derivation
+  ]
+```
+
+The type hierarchy from most to least specific:
+
+```
+Drv "zlib"      -- tagged: provenance known at the type level
+AnyDerivation   -- existential: some HasDerivation, tag erased
+Derivation      -- raw: the .drv the Nix daemon builds
+```
+
+`Drv name` and `AnyDerivation` serve different roles. `Drv name` is the
+default for normal packages — it prevents accidental swaps in typed
+interfaces. `AnyDerivation` is for heterogeneous collections where the
+concrete package is unknown (e.g., `buildInputs` could be
+`[AnyDerivation]` instead of `[Derivation]`).
+
+Infrastructure overrides `Output` as before:
+
+```haskell
+instance Package "stdenv" where
+  type Output "stdenv" = MkDerivationArgs -> AnyDerivation  -- function, not Drv
+instance Package "fetchurl" where
+  type Output "fetchurl" = Text -> Text -> Derivation       -- function, not Drv
+```
+
+`Pkg` instances also carry the tag naturally — `Pkg "openssl"` already
+witnesses provenance (§11.5), and its `HasDerivation` instance bridges
+to `Derivation` when needed.
