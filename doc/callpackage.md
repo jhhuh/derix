@@ -89,47 +89,113 @@ The class is indexed by the package name:
 ```haskell
 class Package (name :: Symbol) where
   type Deps name (pkgs :: Type) :: Constraint
-  callPackage :: forall pkgs -> Deps name pkgs => Derivation
+  type Output name :: Type
+  type Output name = Derivation              -- default for normal packages
+  callPackage :: forall pkgs -> Deps name pkgs => Output name
 ```
 
 - `name` identifies the package (type-level string)
 - `Deps` is an associated constraint family: given a package name and a
   package set type, it returns the constraint that must be satisfied
+- `Output` is the type of what the package produces. Defaults to
+  `Derivation`, but can be anything — a function, a record, a path.
+  This makes the package set **heterogeneous**: fetchers return
+  functions, packages return derivations, utilities return whatever
+  they are
 - `callPackage` takes a package set type (visible `forall`) and, given
-  the dependencies are met, produces a `Derivation`
+  the dependencies are met, produces `Output name`
 
 ## §3 Package Definitions as Instances
 
-Each package is an instance of `Package`:
+### 3.1 Fetchers and Utilities
+
+Not everything in the package set is a derivation. Fetchers are
+**functions** that live in `pkgs` and depend on other packages:
+
+```haskell
+instance Package "fetchurl" where
+  type Deps "fetchurl" pkgs = Has "curl" pkgs
+  type Output "fetchurl" = Text -> Text -> Derivation
+  callPackage @pkgs = \url hash -> mkFixedOutputDrv
+    (callPackage @"curl" @pkgs) url hash
+
+instance Package "fetchFromGitHub" where
+  type Deps "fetchFromGitHub" pkgs = (Has "fetchurl" pkgs, Has "git" pkgs)
+  type Output "fetchFromGitHub" = FetchGitHubArgs -> Derivation
+  callPackage @pkgs = \args ->
+    let fetch = callPackage @"fetchurl" @pkgs
+        git   = callPackage @"git" @pkgs
+    in fetchGitHubWith fetch git args
+```
+
+`Output "fetchurl"` is `Text -> Text -> Derivation`, not `Derivation`.
+The package set is heterogeneous — each entry has its own type, determined
+by `Output`.
+
+In nixpkgs, `pkgs.fetchurl` depends on `pkgs.curl`. Here, `Deps "fetchurl"`
+requires `Has "curl" pkgs`. Same dependency, statically checked.
+
+### 3.2 Normal Packages
+
+Normal packages use the default `Output` (= `Derivation`) and reference
+fetchers from the same package set:
 
 ```haskell
 instance Package "zlib" where
-  type Deps "zlib" pkgs = ()
-  callPackage @pkgs = mkDrv "zlib" "1.3" []
+  type Deps "zlib" pkgs = Has "fetchurl" pkgs
+  callPackage @pkgs = mkDerivation MkDerivationArgs
+    { name = "zlib", version = "1.3"
+    , src = (callPackage @"fetchurl" @pkgs)
+        "https://zlib.net/zlib-1.3.tar.gz"
+        "sha256-abc..."
+    , buildInputs = []
+    }
 
 instance Package "openssl" where
-  type Deps "openssl" pkgs = Has "zlib" pkgs
-  callPackage @pkgs = mkDrv "openssl" "3.1" [callPackage @"zlib" @pkgs]
+  type Deps "openssl" pkgs = (Has "zlib" pkgs, Has "fetchurl" pkgs)
+  callPackage @pkgs = mkDerivation MkDerivationArgs
+    { name = "openssl", version = "3.1"
+    , src = (callPackage @"fetchurl" @pkgs)
+        "https://openssl.org/source/openssl-3.1.tar.gz"
+        "sha256-def..."
+    , buildInputs = [callPackage @"zlib" @pkgs]
+    }
 
 instance Package "curl" where
-  type Deps "curl" pkgs = (Has "openssl" pkgs, Has "zlib" pkgs)
-  callPackage @pkgs = mkDrv "curl" "8.5"
-    [callPackage @"openssl" @pkgs, callPackage @"zlib" @pkgs]
-
-instance Package "python" where
-  type Deps "python" pkgs = (Has "openssl" pkgs, Has "zlib" pkgs)
-  callPackage @pkgs = mkDrv "python" "3.12"
-    [callPackage @"openssl" @pkgs, callPackage @"zlib" @pkgs]
+  type Deps "curl" pkgs = (Has "openssl" pkgs, Has "zlib" pkgs, Has "fetchurl" pkgs)
+  callPackage @pkgs = mkDerivation MkDerivationArgs
+    { name = "curl", version = "8.5"
+    , src = (callPackage @"fetchurl" @pkgs)
+        "https://curl.se/download/curl-8.5.tar.gz"
+        "sha256-ghi..."
+    , buildInputs =
+        [ callPackage @"openssl" @pkgs
+        , callPackage @"zlib" @pkgs
+        ]
+    }
 ```
 
-Here `mkDrv` constructs the concrete `Derivation` from §0. The
-dependency list (`[callPackage @"zlib" @pkgs]`) populates `drvInputDrvs`
-— these are real store paths to other `.drv` files that the Nix daemon
-will build first.
+`callPackage @"fetchurl" @pkgs` returns a function (not a derivation).
+Applying it to url + hash produces a fixed-output derivation. The
+fetcher's dependency on curl is resolved through the same `pkgs`.
 
-`callPackage @"zlib" @pkgs` inside openssl's body calls `callPackage`
-from `Package "zlib"` at the same `pkgs` type. This requires
-`Has "zlib" pkgs`, which is exactly what `Deps "openssl" pkgs` provides.
+### 3.3 The Dependency Chain
+
+Everything flows through `pkgs`:
+
+```
+openssl
+  ├── src: (callPackage @"fetchurl" @pkgs) url hash
+  │         └── fetchurl depends on: callPackage @"curl" @pkgs
+  │             └── curl depends on: ... (bootstrap)
+  └── buildInputs: [callPackage @"zlib" @pkgs]
+                     └── zlib depends on: callPackage @"fetchurl" @pkgs
+                         └── fetchurl depends on: ... (same curl)
+```
+
+In practice, the bootstrap breaks the circularity: the fetcher used
+during bootstrap is a pre-built binary, not the curl from `pkgs`.
+See encoding §5 for how staged bootstrap resolves this.
 
 ## §4 The `Has` Class: Package Set Membership
 
@@ -147,14 +213,21 @@ packages that have a recipe. An instance `Has "zlib" Nixpkgs` says
 
 ## §5 Package Set Construction
 
-A concrete package set declares which packages it contains:
+A concrete package set declares which packages it contains — both
+packages and fetchers:
 
 ```haskell
 data Nixpkgs
 
+-- Infrastructure (fetchers, utilities)
+instance Has "curl"            Nixpkgs
+instance Has "git"             Nixpkgs
+instance Has "fetchurl"        Nixpkgs
+instance Has "fetchFromGitHub" Nixpkgs
+
+-- Packages
 instance Has "zlib"    Nixpkgs
 instance Has "openssl" Nixpkgs
-instance Has "curl"    Nixpkgs
 instance Has "python"  Nixpkgs
 ```
 
@@ -164,9 +237,10 @@ Usage:
 main = print (callPackage @"python" @Nixpkgs)
 ```
 
-GHC resolves `Deps "python" Nixpkgs = (Has "openssl" Nixpkgs, Has "zlib" Nixpkgs)`,
-finds both instances, and proceeds. Inside the body, `callPackage @"openssl" @Nixpkgs`
-triggers resolution of `Deps "openssl" Nixpkgs = Has "zlib" Nixpkgs`, also found.
+GHC resolves `Deps "python" Nixpkgs`, which requires `Has "openssl" Nixpkgs`,
+`Has "zlib" Nixpkgs`, and `Has "fetchurl" Nixpkgs`. All declared, so
+resolution proceeds. The fetcher dependency is tracked just like any
+package dependency.
 
 If you declare `Has "curl" Nixpkgs` but not `Has "openssl" Nixpkgs`,
 GHC reports: `No instance for Has "openssl" Nixpkgs` — unsatisfied
@@ -180,12 +254,18 @@ The encoding separates three things:
 |---|---|---|
 | Recipe | `Package` instance | `.nix` file |
 | Dependencies | `Deps` associated constraint | Function formal params |
+| Output type | `Output` associated type | Derivation, function, attrset, ... |
 | Package set | `Has` instances for a type | `callPackage` wiring in `all-packages.nix` |
 
 A recipe is defined once (one `Package` instance per package name) and
 is package-set-independent. A package set chooses which recipes to
 include by declaring `Has` instances. This mirrors Nix's separation
 between `pkgs/by-name/` (recipes) and `all-packages.nix` (wiring).
+
+The package set is heterogeneous: `callPackage @"zlib" @Nixpkgs` returns
+a `Derivation`, while `callPackage @"fetchurl" @Nixpkgs` returns a
+`Text -> Text -> Derivation`. The type of each entry is determined by
+`Output name`, known at compile time.
 
 ## §7 Resolution Flow
 
@@ -244,10 +324,9 @@ cannot express "anything that has openssl automatically has zlib" — that
 requires a per-package class declaration with per-package superclass.
 Propagated dependencies (encoding §2) are lost.
 
-**No per-package methods.** The class has one method (`callPackage`)
-returning `Derivation`. Multiple outputs, typed interfaces, version
-accessors — these need additional machinery (associated types on
-`Package`, or a richer return type).
+**No per-package methods.** The class has one method (`callPackage`).
+Multiple outputs and typed interfaces need a richer `Output` type
+(e.g., a record with `lib`, `dev`, `doc` fields).
 
 **Overlays require separate design.** With one class and `Symbol`
 indexing, you cannot have two `Package "openssl"` instances (different
@@ -264,14 +343,17 @@ Nix                              Haskell (this encoding)
 ──────────────────────────────── ────────────────────────────────
 { zlib, perl }:                  type Deps "openssl" pkgs =
   mkDerivation { ... }             (Has "zlib" pkgs, Has "perl" pkgs)
-                                 callPackage @pkgs = mkDrv ...
+                                 callPackage @pkgs = mkDerivation ...
 
 callPackage ./openssl.nix {}     callPackage @"openssl" @Nixpkgs
 
 pkgs = self: { ... }             data Nixpkgs
                                  instance Has "zlib" Nixpkgs
-                                 instance Has "openssl" Nixpkgs
+                                 instance Has "fetchurl" Nixpkgs
                                  ...
+
+pkgs.fetchurl                    callPackage @"fetchurl" @Nixpkgs
+  (a function, not a drv)          :: Text -> Text -> Derivation
 
 builtins.functionArgs            Deps "openssl" pkgs
                                  (type family, inspectable)
@@ -288,18 +370,27 @@ checks at evaluation time, GHC checks at compile time.
 
 ### 11.1 Multiple Outputs
 
+`Output` (now in the core class) handles this directly:
+
 ```haskell
-class Package (name :: Symbol) where
-  type Deps name pkgs :: Constraint
-  type Output name :: Type                  -- NEW
-  type Output name = Derivation             -- default
-  callPackage :: forall pkgs -> Deps name pkgs => Output name
+data OpensslOutputs = OpensslOutputs
+  { opensslLib :: Derivation
+  , opensslDev :: Derivation
+  , opensslDoc :: Derivation
+  }
 
 instance Package "openssl" where
-  type Deps "openssl" pkgs = Has "zlib" pkgs
-  type Output "openssl" = OpensslOutputs    -- lib, dev, doc
-  callPackage @pkgs = OpensslOutputs { ... }
+  type Deps "openssl" pkgs = (Has "zlib" pkgs, Has "fetchurl" pkgs)
+  type Output "openssl" = OpensslOutputs
+  callPackage @pkgs = OpensslOutputs
+    { opensslLib = ...
+    , opensslDev = ...
+    , opensslDoc = ...
+    }
 ```
+
+Consumers pick which output: `opensslDev (callPackage @"openssl" @pkgs)`.
+Unused outputs are never forced (laziness).
 
 ### 11.2 Version Information
 
