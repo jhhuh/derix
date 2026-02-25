@@ -262,7 +262,6 @@ openssl
 
 In practice, the bootstrap breaks the circularity: the fetcher used
 during bootstrap is a pre-built binary, not the curl from `pkgs`.
-See encoding §5 for how staged bootstrap resolves this.
 
 ## §4 The `Has` Class: Package Set Membership
 
@@ -368,10 +367,10 @@ by both openssl and python.
 
 ## §8 What This Buys
 
-**`callPackage` is a first-class concept.** In the multi-class encoding
-(encoding §1), `callPackage` is implicit — it's the act of writing an
-instance. Here, it's an actual method you can call, with a uniform
-signature across all packages.
+**`callPackage` is a first-class concept.** In a multi-class encoding
+(one class per package), `callPackage` is implicit — it's the act of
+writing an instance. Here, it's an actual method you can call, with a
+uniform signature across all packages.
 
 **Recipes are package-set-independent.** The `Package` instance for
 openssl doesn't mention `Nixpkgs`. It works for any `pkgs` that
@@ -393,7 +392,7 @@ need?" is a type-level question with a type-level answer.
 is one superclass context (namely `Package name => Has name pkgs`). You
 cannot express "anything that has openssl automatically has zlib" — that
 requires a per-package class declaration with per-package superclass.
-Propagated dependencies (encoding §2) are lost.
+Propagated dependencies are lost (see §11.3 for a workaround).
 
 **No per-package methods.** The class has one method (`callPackage`).
 Multiple outputs and typed interfaces need a richer `Output` type
