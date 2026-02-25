@@ -57,33 +57,9 @@ missing argument error           No instance for Has "foo" Nixpkgs
 - [`doc/encoding.md`](doc/encoding.md) — survey of GHC features mapped
   to package management concepts
 
-## Prototype
-
-The Haskell prototype in [`src/`](src/) demonstrates that **Haskell's
-laziness IS the calculus's operational semantics**:
-
-```haskell
-buildPkgSet env =
-  let pkgSet = Map.fromList
-        [ (name, resolveEntry name)
-        | name <- allNames env
-        ]
-      resolveEntry name = ... resolve env pkgSet (deps name) ...
-  in pkgSet
-```
-
-`pkgSet` references itself — that's the `fix`. GHC's runtime provides
-sharing, black-hole detection (`<<loop>>`), and demand-driven evaluation.
-
-```sh
-nix develop -c cabal run derix
-```
-
 ## Status
 
-**Actively exploring the design space.** The prototype in `src/`
-demonstrates the core lazy-fixed-point idea but does not track the
-documents' evolving design.
+**Actively exploring the design space.**
 
 ## License
 
