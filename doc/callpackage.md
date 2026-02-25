@@ -450,3 +450,78 @@ instance Has "zlib" Minimal
 -- ERROR: No instance for Has "openssl" Minimal
 -- Tells you exactly what's missing.
 ```
+
+### 11.5 Per-Package Data Types (`Pkg` Data Family)
+
+In Nix, `{ openssl, zlib, perl }:` binds named variables. In this
+encoding, you write `callPackage @"openssl" @pkgs` everywhere — verbose,
+and no structured access to package-specific metadata (headers path,
+version string, sub-libraries).
+
+An open data family gives each package an optional record type:
+
+```haskell
+data family Pkg (name :: Symbol)
+```
+
+Packages that benefit from structured access define an instance:
+
+```haskell
+data instance Pkg "openssl" = Openssl
+  { opensslDrv     :: Derivation
+  , opensslHeaders :: StorePath
+  , opensslVersion :: Text
+  }
+```
+
+A separate class constructs the record from the resolved package:
+
+```haskell
+class Package name => HasPkg (name :: Symbol) where
+  pkgMeta :: forall pkgs -> Has name pkgs => Pkg name
+
+instance HasPkg "openssl" where
+  pkgMeta @pkgs =
+    let drv = callPackage @"openssl" @pkgs
+    in Openssl
+      { opensslDrv     = drv
+      , opensslHeaders = drvOutPath drv <> "/include"
+      , opensslVersion = "3.1"
+      }
+```
+
+The payoff is `RecordWildCards` in recipe bodies:
+
+```haskell
+instance Package "curl" where
+  type Deps "curl" pkgs =
+    (Has "openssl" pkgs, Has "zlib" pkgs, Has "fetchurl" pkgs)
+  callPackage @pkgs =
+    let Openssl{..} = pkgMeta @"openssl" @pkgs
+    -- opensslDrv, opensslHeaders, opensslVersion now in scope
+    in mkDerivation MkDerivationArgs
+      { name = "curl", version = "8.5"
+      , src = (callPackage @"fetchurl" @pkgs)
+          "https://curl.se/download/curl-8.5.tar.gz"
+          "sha256-ghi..."
+      , buildInputs = [opensslDrv, callPackage @"zlib" @pkgs]
+      , configureFlags =
+          ["--with-ssl-headers=" <> opensslHeaders]
+      }
+```
+
+Key properties:
+
+- **Optional.** Packages without a `Pkg` instance are used via
+  `callPackage` directly. The data family is open — define instances
+  only when the ergonomics matter.
+- **Not the `Output`.** `callPackage @"openssl"` still returns
+  `Derivation` (or whatever `Output "openssl"` is). `Pkg "openssl"`
+  is a convenience wrapper constructed from the output, not a
+  replacement for it.
+- **Proof-carrying.** A value of type `Pkg "openssl"` witnesses that
+  openssl was resolved. The constructor name `Openssl` can be used
+  in pattern matching to make the provenance of each field explicit.
+- **Namespaced fields.** By convention, field names are prefixed with
+  the package name (`opensslHeaders`, not `headers`). With
+  `RecordWildCards`, these come into scope without clashing.
