@@ -2,6 +2,48 @@
 
 Starting from scratch. If `pkgs` is a type, what is `callPackage`?
 
+Building is delegated to the Nix daemon — `Derivation` is a concrete
+Nix store derivation, not an abstract type.
+
+## §0 `Derivation`: The Concrete Type
+
+A `Derivation` is exactly what the Nix daemon builds — a `.drv` file in
+the Nix store. The Haskell type mirrors the ATerm format:
+
+```haskell
+data Derivation = Derivation
+  { drvOutputs   :: Map Text DerivationOutput
+  , drvInputDrvs :: Map StorePath (Set Text)  -- drv path → outputs needed
+  , drvInputSrcs :: Set StorePath             -- direct source paths
+  , drvPlatform  :: Text                      -- e.g. "x86_64-linux"
+  , drvBuilder   :: Text                      -- e.g. "/bin/bash"
+  , drvArgs      :: [Text]                    -- builder arguments
+  , drvEnv       :: Map Text Text             -- environment variables
+  }
+
+data DerivationOutput = DerivationOutput
+  { outputPath     :: Maybe StorePath         -- Nothing = content-addressed
+  , outputHashAlgo :: Maybe Text              -- e.g. "sha256"
+  , outputHash     :: Maybe Text              -- fixed-output hash
+  }
+
+type StorePath = Text  -- e.g. "/nix/store/abc123...-zlib-1.3"
+```
+
+This is the same structure as `nix derivation show` outputs. To build:
+
+```haskell
+build :: Derivation -> IO StorePath
+build drv = do
+  drvPath <- addToStore drv    -- nix-store --add / daemon protocol
+  nixBuild drvPath             -- nix-store --realise
+```
+
+The key consequence: `callPackage` doesn't return a hypothetical
+build plan — it returns something the Nix daemon can **actually build**.
+Dependencies in `drvInputDrvs` are real store paths to other `.drv`
+files, produced by other `callPackage` invocations.
+
 ## §1 The Core Observation
 
 In Nix, a package recipe is a function:
@@ -80,10 +122,14 @@ instance Package "python" where
     [callPackage @"openssl" @pkgs, callPackage @"zlib" @pkgs]
 ```
 
-Note: `callPackage @"zlib" @pkgs` inside openssl's body calls
-`callPackage` from `Package "zlib"` at the same `pkgs` type. This
-requires `Has "zlib" pkgs`, which is exactly what `Deps "openssl" pkgs`
-provides.
+Here `mkDrv` constructs the concrete `Derivation` from §0. The
+dependency list (`[callPackage @"zlib" @pkgs]`) populates `drvInputDrvs`
+— these are real store paths to other `.drv` files that the Nix daemon
+will build first.
+
+`callPackage @"zlib" @pkgs` inside openssl's body calls `callPackage`
+from `Package "zlib"` at the same `pkgs` type. This requires
+`Has "zlib" pkgs`, which is exactly what `Deps "openssl" pkgs` provides.
 
 ## §4 The `Has` Class: Package Set Membership
 
