@@ -2,17 +2,17 @@
 
 Starting from scratch. If `pkgs` is a type, what is `callPackage`?
 
-Building is delegated to the Nix daemon — `Derivation` is a concrete
-Nix store derivation, not an abstract type.
+Building is delegated to the Nix daemon — `Drv` is the concrete `.drv`
+file, `Derivation name` is the richer Haskell-side wrapper.
 
-## §0 `Derivation`: The Concrete Type
+## §0 `Drv`: The Store Derivation
 
-A `Derivation` is exactly what the Nix daemon builds — a `.drv` file in
-the Nix store. The Haskell type mirrors the ATerm format:
+A `Drv` is exactly what the Nix daemon builds — a `.drv` file in the
+Nix store. The Haskell type mirrors the ATerm format:
 
 ```haskell
-data Derivation = Derivation
-  { drvOutputs   :: Map Text DerivationOutput
+data Drv = Drv
+  { drvOutputs   :: Map Text DrvOutput
   , drvInputDrvs :: Map StorePath (Set Text)  -- drv path → outputs needed
   , drvInputSrcs :: Set StorePath             -- direct source paths
   , drvPlatform  :: Text                      -- e.g. "x86_64-linux"
@@ -21,7 +21,7 @@ data Derivation = Derivation
   , drvEnv       :: Map Text Text             -- environment variables
   }
 
-data DerivationOutput = DerivationOutput
+data DrvOutput = DrvOutput
   { outputPath     :: Maybe StorePath         -- Nothing = content-addressed
   , outputHashAlgo :: Maybe Text              -- e.g. "sha256"
   , outputHash     :: Maybe Text              -- fixed-output hash
@@ -33,16 +33,18 @@ type StorePath = Text  -- e.g. "/nix/store/abc123...-zlib-1.3"
 This is the same structure as `nix derivation show` outputs. To build:
 
 ```haskell
-build :: Derivation -> IO StorePath
+build :: Drv -> IO StorePath
 build drv = do
   drvPath <- addToStore drv    -- nix-store --add / daemon protocol
   nixBuild drvPath             -- nix-store --realise
 ```
 
-The key consequence: `callPackage` doesn't return a hypothetical
-build plan — it returns something the Nix daemon can **actually build**.
-Dependencies in `drvInputDrvs` are real store paths to other `.drv`
-files, produced by other `callPackage` invocations.
+The naming follows Nix: a `.drv` file contains only the essential
+build specification (outputs, inputs, builder, environment). The richer
+`Derivation name` type (§2.1) wraps a `Drv` with additional
+Haskell-side information. Dependencies in `drvInputDrvs` are real
+store paths to other `.drv` files, produced by other `callPackage`
+invocations.
 
 ## §1 The Core Observation
 
@@ -63,7 +65,7 @@ In Haskell, if `pkgs` is a type representing the package set, the recipe
 has signature:
 
 ```haskell
-openssl :: forall pkgs -> Derivation
+openssl :: forall pkgs -> Derivation "openssl"
 ```
 
 But bare `forall pkgs ->` gives no access to the package set's contents.
@@ -71,7 +73,7 @@ To reference other packages, you need **constraints** — the dependency
 declaration:
 
 ```haskell
-openssl :: forall pkgs -> (Has "zlib" pkgs, Has "perl" pkgs) => Derivation
+openssl :: forall pkgs -> (Has "zlib" pkgs, Has "perl" pkgs) => Derivation "openssl"
 ```
 
 The Nix formal parameters `{ zlib, perl }` become Haskell constraints
@@ -90,7 +92,7 @@ The class is indexed by the package name:
 class Package (name :: Symbol) where
   type Deps name (pkgs :: Type) :: Constraint
   type Output name :: Type
-  type Output name = AnyDerivation            -- default for normal packages
+  type Output name = Derivation name          -- default for normal packages
   callPackage :: forall pkgs -> Deps name pkgs => Output name
 ```
 
@@ -98,44 +100,47 @@ class Package (name :: Symbol) where
 - `Deps` is an associated constraint family: given a package name and a
   package set type, it returns the constraint that must be satisfied
 - `Output` is the type of what the package produces. Defaults to
-  `AnyDerivation` (see below), but can be anything — a function, a
+  `Derivation name` (see below), but can be anything — a function, a
   record, a path. This makes the package set **heterogeneous**: fetchers
   return functions, packages return derivations, utilities return
   whatever they are
 - `callPackage` takes a package set type (visible `forall`) and, given
   the dependencies are met, produces `Output name`
 
-### 2.1 `HasDerivation` and `AnyDerivation`
+### 2.1 `HasDrv`, `Derivation`
 
-Not every package output is a bare `Derivation`, but most can produce
-one. The `HasDerivation` class captures this:
-
-```haskell
-class HasDerivation a where
-  toDerivation :: a -> Derivation
-
-instance HasDerivation Derivation where
-  toDerivation = id
-```
-
-The default `Output` is an existentially quantified wrapper — any type
-that knows how to produce a `Derivation`:
+Not every package output is a bare `Drv`, but most can produce one.
+The `HasDrv` class captures this:
 
 ```haskell
-data AnyDerivation = forall a. HasDerivation a => MkAnyDerivation a
+class HasDrv a where
+  toDrv :: a -> Drv
 
-instance HasDerivation AnyDerivation where
-  toDerivation (MkAnyDerivation x) = toDerivation x
+instance HasDrv Drv where
+  toDrv = id
 ```
 
-A package returning `AnyDerivation` can internally carry any rich type
-(with version info, multiple outputs, metadata) while presenting a
-uniform interface. Consumers that need a `Derivation` call
-`toDerivation`. Consumers that know the concrete type (via `Pkg`, see
-§11.5) can access the richer structure.
+The default `Output` is `Derivation name` — existentially quantified
+and phantom-tagged with the package name:
 
+```haskell
+data Derivation (name :: Symbol) = forall a. HasDrv a => Derivation a
+
+instance HasDrv (Derivation name) where
+  toDrv (Derivation x) = toDrv x
+```
+
+`Derivation name` combines two features:
+
+- **Phantom tag.** `Derivation "zlib"` and `Derivation "openssl"` are
+  distinct types. Accidentally swapping them is a compile error.
+- **Existential.** The wrapped `a` can carry any rich type (version
+  info, multiple outputs, metadata) as long as it has a `HasDrv`
+  instance. The extra information survives inside the existential.
+
+Consumers that need a raw `Drv` (e.g., for `buildInputs`) call `toDrv`.
 Infrastructure like stdenv and fetchers override `Output` with specific
-types (functions). Normal packages use the default `AnyDerivation`.
+types (functions). Normal packages use the default `Derivation name`.
 
 ## §3 Package Definitions as Instances
 
@@ -148,13 +153,13 @@ live in `pkgs` and depend on other packages:
 ```haskell
 instance Package "fetchurl" where
   type Deps "fetchurl" pkgs = Has "curl" pkgs
-  type Output "fetchurl" = Text -> Text -> Derivation
+  type Output "fetchurl" = Text -> Text -> Drv
   callPackage @pkgs = \url hash -> mkFixedOutputDrv
-    (callPackage @"curl" @pkgs) url hash
+    (toDrv $ callPackage @"curl" @pkgs) url hash
 
 instance Package "fetchFromGitHub" where
   type Deps "fetchFromGitHub" pkgs = (Has "fetchurl" pkgs, Has "git" pkgs)
-  type Output "fetchFromGitHub" = FetchGitHubArgs -> Derivation
+  type Output "fetchFromGitHub" = FetchGitHubArgs -> Drv
   callPackage @pkgs = \args ->
     let fetch = callPackage @"fetchurl" @pkgs
         git   = callPackage @"git" @pkgs
@@ -168,19 +173,19 @@ and other bootstrap tools. Same here:
 ```haskell
 instance Package "stdenv" where
   type Deps "stdenv" pkgs = (Has "gcc" pkgs, Has "coreutils" pkgs, Has "bash" pkgs)
-  type Output "stdenv" = MkDerivationArgs -> AnyDerivation
+  type Output "stdenv" = MkDerivationArgs -> Drv
   callPackage @pkgs = \args ->
     let gcc       = callPackage @"gcc" @pkgs
         coreutils = callPackage @"coreutils" @pkgs
         bash      = callPackage @"bash" @pkgs
-    in MkAnyDerivation $ buildWithStdenv gcc coreutils bash args
+    in buildWithStdenv gcc coreutils bash args
 ```
 
-`Output "stdenv"` is `MkDerivationArgs -> AnyDerivation` — a builder
-function, not a derivation. The `MkAnyDerivation` wrapping happens
-once here; every package that uses `mkDerivation` gets `AnyDerivation`
-for free. `mkDerivation` is no longer a magic top-level function; it's
-resolved from `pkgs` like everything else.
+`Output "stdenv"` is `MkDerivationArgs -> Drv` — a builder function
+that produces a raw `Drv`. Normal packages wrap the result in
+`Derivation` (§3.2), tagging it with their name. `mkDerivation` is no
+longer a magic top-level function; it's resolved from `pkgs` like
+everything else.
 
 The package set is heterogeneous — each entry has its own type, determined
 by `Output`.
@@ -190,17 +195,17 @@ requires `Has "curl" pkgs`. Same dependency, statically checked.
 
 ### 3.2 Normal Packages
 
-Normal packages use the default `Output` (= `AnyDerivation`). Since
-`mkDerivation` from stdenv already returns `AnyDerivation`, the types
-line up directly. Dependencies in `buildInputs` go through
-`toDerivation`:
+Normal packages use the default `Output` (= `Derivation name`). The
+`mkDerivation` from stdenv produces a raw `Drv`; the package wraps it
+in `Derivation`, tagging it with the package name. Dependencies in
+`buildInputs` are `[Drv]`, extracted via `toDrv`:
 
 ```haskell
 instance Package "zlib" where
   type Deps "zlib" pkgs = (Has "stdenv" pkgs, Has "fetchurl" pkgs)
   callPackage @pkgs =
-    let mkDerivation = callPackage @"stdenv" @pkgs
-    in mkDerivation MkDerivationArgs
+    let mkDrv = callPackage @"stdenv" @pkgs
+    in Derivation $ mkDrv MkDerivationArgs
       { name = "zlib", version = "1.3"
       , src = (callPackage @"fetchurl" @pkgs)
           "https://zlib.net/zlib-1.3.tar.gz"
@@ -211,28 +216,28 @@ instance Package "zlib" where
 instance Package "openssl" where
   type Deps "openssl" pkgs = (Has "stdenv" pkgs, Has "zlib" pkgs, Has "fetchurl" pkgs)
   callPackage @pkgs =
-    let mkDerivation = callPackage @"stdenv" @pkgs
-    in mkDerivation MkDerivationArgs
+    let mkDrv = callPackage @"stdenv" @pkgs
+    in Derivation $ mkDrv MkDerivationArgs
       { name = "openssl", version = "3.1"
       , src = (callPackage @"fetchurl" @pkgs)
           "https://openssl.org/source/openssl-3.1.tar.gz"
           "sha256-def..."
-      , buildInputs = [toDerivation $ callPackage @"zlib" @pkgs]
+      , buildInputs = [toDrv $ callPackage @"zlib" @pkgs]
       }
 
 instance Package "curl" where
   type Deps "curl" pkgs =
     (Has "stdenv" pkgs, Has "openssl" pkgs, Has "zlib" pkgs, Has "fetchurl" pkgs)
   callPackage @pkgs =
-    let mkDerivation = callPackage @"stdenv" @pkgs
-    in mkDerivation MkDerivationArgs
+    let mkDrv = callPackage @"stdenv" @pkgs
+    in Derivation $ mkDrv MkDerivationArgs
       { name = "curl", version = "8.5"
       , src = (callPackage @"fetchurl" @pkgs)
           "https://curl.se/download/curl-8.5.tar.gz"
           "sha256-ghi..."
       , buildInputs =
-          [ toDerivation $ callPackage @"openssl" @pkgs
-          , toDerivation $ callPackage @"zlib" @pkgs
+          [ toDrv $ callPackage @"openssl" @pkgs
+          , toDrv $ callPackage @"zlib" @pkgs
           ]
       }
 ```
@@ -329,8 +334,8 @@ include by declaring `Has` instances. This mirrors Nix's separation
 between `pkgs/by-name/` (recipes) and `all-packages.nix` (wiring).
 
 The package set is heterogeneous: `callPackage @"zlib" @Nixpkgs` returns
-a `Derivation`, while `callPackage @"fetchurl" @Nixpkgs` returns a
-`Text -> Text -> Derivation`. The type of each entry is determined by
+a `Derivation "zlib"`, while `callPackage @"fetchurl" @Nixpkgs` returns
+a `Text -> Text -> Drv`. The type of each entry is determined by
 `Output name`, known at compile time.
 
 ## §7 Resolution Flow
@@ -410,10 +415,11 @@ Nix                              Haskell (this encoding)
 { stdenv, zlib, perl }:          type Deps "openssl" pkgs =
   stdenv.mkDerivation { ... }      (Has "stdenv" pkgs, Has "zlib" pkgs, ...)
                                  callPackage @pkgs =
-                                   let mk = callPackage @"stdenv" @pkgs
-                                   in mk MkDerivationArgs { ... }
+                                   let mkDrv = callPackage @"stdenv" @pkgs
+                                   in Derivation $ mkDrv MkDerivationArgs { ... }
 
 callPackage ./openssl.nix {}     callPackage @"openssl" @Nixpkgs
+                                   :: Derivation "openssl"
 
 pkgs = self: { ... }             data Nixpkgs
                                  instance Has "stdenv" Nixpkgs
@@ -422,10 +428,10 @@ pkgs = self: { ... }             data Nixpkgs
                                  ...
 
 pkgs.stdenv.mkDerivation         callPackage @"stdenv" @Nixpkgs
-  (a function, not a drv)          :: MkDerivationArgs -> Derivation
+  (a function, not a drv)          :: MkDerivationArgs -> Drv
 
 pkgs.fetchurl                    callPackage @"fetchurl" @Nixpkgs
-  (a function, not a drv)          :: Text -> Text -> Derivation
+  (a function, not a drv)          :: Text -> Text -> Drv
 
 builtins.functionArgs            Deps "openssl" pkgs
                                  (type family, inspectable)
@@ -446,22 +452,22 @@ checks at evaluation time, GHC checks at compile time.
 
 ```haskell
 data OpensslOutputs = OpensslOutputs
-  { opensslLib :: Derivation
-  , opensslDev :: Derivation
-  , opensslDoc :: Derivation
+  { lib :: Drv
+  , dev :: Drv
+  , doc :: Drv
   }
 
 instance Package "openssl" where
   type Deps "openssl" pkgs = (Has "zlib" pkgs, Has "fetchurl" pkgs)
   type Output "openssl" = OpensslOutputs
   callPackage @pkgs = OpensslOutputs
-    { opensslLib = ...
-    , opensslDev = ...
-    , opensslDoc = ...
+    { lib = ...
+    , dev = ...
+    , doc = ...
     }
 ```
 
-Consumers pick which output: `opensslDev (callPackage @"openssl" @pkgs)`.
+Consumers pick which output: `dev (callPackage @"openssl" @pkgs)`.
 Unused outputs are never forced (laziness).
 
 ### 11.2 Version Information
@@ -525,7 +531,7 @@ instance Has "zlib" Minimal
 
 ### 11.5 Per-Package Data Types (`Pkg` Data Family)
 
-The core spec is `Package`, `Has`, and `HasDerivation`/`AnyDerivation`.
+The core spec is `Package`, `Has`, `HasDrv`, and `Derivation name`.
 Everything below is a suggested ergonomic pattern, not part of the spec.
 
 In Nix, `{ openssl, zlib, perl }:` binds named variables. In this
@@ -543,9 +549,9 @@ Packages that benefit from structured access define an instance:
 
 ```haskell
 data instance Pkg "openssl" = Openssl
-  { opensslDrv     :: Derivation
-  , opensslHeaders :: StorePath
-  , opensslVersion :: Text
+  { drv     :: Drv
+  , headers :: StorePath
+  , version :: Text
   }
 ```
 
@@ -564,24 +570,24 @@ The output of `callPackage` flows into `pkgMeta`, which enriches it:
 ```haskell
 instance HasPkg "openssl" where
   pkgMeta @pkgs output =
-    let drv = toDerivation output
+    let d = toDrv output
     in Openssl
-      { opensslDrv     = drv
-      , opensslHeaders = drvOutPath drv <> "/include"
-      , opensslVersion = "3.1"
+      { drv     = d
+      , headers = drvOutPath d <> "/include"
+      , version = "3.1"
       }
 ```
 
-`pkgMeta` receives the `AnyDerivation` from `callPackage`, extracts
-the `Derivation` via `toDerivation`, and bundles it with metadata.
+`pkgMeta` receives the `Derivation "openssl"` from `callPackage`,
+extracts the `Drv` via `toDrv`, and bundles it with metadata.
 The `Pkg` record has both: the build result (output info) and version,
 paths, flags (input info).
 
-`Pkg` instances are themselves `HasDerivation`, closing the loop:
+`Pkg` instances are themselves `HasDrv`, closing the loop:
 
 ```haskell
-instance HasDerivation (Pkg "openssl") where
-  toDerivation = opensslDrv
+instance HasDrv (Pkg "openssl") where
+  toDrv = drv
 ```
 
 The biggest payoff: `stdenv` itself gets a `Pkg` instance. Since almost
@@ -590,19 +596,22 @@ RecordWildCards brings it into scope automatically:
 
 ```haskell
 data instance Pkg "stdenv" = Stdenv
-  { mkDerivation :: MkDerivationArgs -> AnyDerivation
+  { mkDerivation :: MkDerivationArgs -> Drv
   , cc           :: StorePath
   }
 
 instance HasPkg "stdenv" where
   pkgMeta @pkgs build = Stdenv
     { mkDerivation = build
-    , cc = drvOutPath (toDerivation $ callPackage @"gcc" @pkgs) <> "/bin/gcc"
+    , cc = drvOutPath (toDrv $ callPackage @"gcc" @pkgs) <> "/bin/gcc"
     }
 ```
 
 Now recipe bodies become concise — destructure dependencies with
-RecordWildCards, and `mkDerivation` appears as a local function:
+RecordWildCards, and `mkDerivation` appears as a local function.
+Since Haskell's `let` bindings are recursive, a package can also
+bind its own `pkgMeta` — useful when the metadata depends on the
+build result:
 
 ```haskell
 instance Package "curl" where
@@ -611,15 +620,16 @@ instance Package "curl" where
   callPackage @pkgs =
     let Stdenv{..}  = pkgMeta @"stdenv"  @pkgs (callPackage @"stdenv" @pkgs)
         Openssl{..} = pkgMeta @"openssl" @pkgs (callPackage @"openssl" @pkgs)
-    -- mkDerivation, cc, opensslDrv, opensslHeaders, opensslVersion in scope
-    in mkDerivation MkDerivationArgs
+        self        = pkgMeta @"curl"    @pkgs (callPackage @"curl" @pkgs)
+    -- mkDerivation, cc, drv, headers, version, self all in scope
+    in Derivation $ mkDerivation MkDerivationArgs
       { name = "curl", version = "8.5"
       , src = (callPackage @"fetchurl" @pkgs)
           "https://curl.se/download/curl-8.5.tar.gz"
           "sha256-ghi..."
-      , buildInputs = [opensslDrv, toDerivation $ callPackage @"zlib" @pkgs]
+      , buildInputs = [drv, toDrv $ callPackage @"zlib" @pkgs]
       , configureFlags =
-          ["--with-ssl-headers=" <> opensslHeaders]
+          ["--with-ssl-headers=" <> headers]
       }
 ```
 
@@ -636,85 +646,43 @@ Key properties:
 - **Both input and output.** `pkgMeta` takes the `callPackage` result
   (output info) and enriches it with metadata (input info). The `Pkg`
   record captures both sides of the build process.
-- **`HasDerivation` bridge.** `Pkg` instances implement `HasDerivation`,
-  so they can flow into `buildInputs` via `toDerivation`. A `Pkg`
-  value carries rich structure but can always be projected to a
-  `Derivation`.
+- **Self-referential.** Recursive `let` allows a package to bind its
+  own `pkgMeta self`, which Haskell's laziness evaluates on demand.
+- **`HasDrv` bridge.** `Pkg` instances implement `HasDrv`, so they
+  can flow into `buildInputs` via `toDrv`. A `Pkg` value carries
+  rich structure but can always be projected to a `Drv`.
 - **Proof-carrying.** A value of type `Pkg "openssl"` witnesses that
   openssl was resolved. The constructor name `Openssl` can be used
   in pattern matching to make the provenance of each field explicit.
-- **Namespaced fields.** By convention, field names are prefixed with
-  the package name (`opensslHeaders`, not `headers`). With
-  `RecordWildCards`, these come into scope without clashing.
 
-### 11.6 Phantom-Tagged Derivations
+### 11.6 `Derivation` as Both Tag and Carrier
 
-A bare `Derivation` is untyped — nothing stops you from passing a gcc
-derivation where zlib is expected. A phantom type tags derivations with
-their package name:
+(Now part of the core design — see §2.1.)
 
-```haskell
-newtype Drv (name :: Symbol) = Drv { unDrv :: Derivation }
+`Derivation name` unifies two features that were previously separate:
 
-instance HasDerivation (Drv name) where
-  toDerivation = unDrv
-```
-
-If the default `Output` is `Drv name` instead of `AnyDerivation`:
+- **Phantom tag** (prevents swapping `Derivation "gcc"` for
+  `Derivation "zlib"` at compile time — zero runtime cost)
+- **Existential carrier** (wraps any `HasDrv a`, carrying extra
+  information beyond the raw `Drv`)
 
 ```haskell
-class Package (name :: Symbol) where
-  type Deps name (pkgs :: Type) :: Constraint
-  type Output name :: Type
-  type Output name = Drv name               -- phantom-tagged by default
-  callPackage :: forall pkgs -> Deps name pkgs => Output name
-```
-
-then `callPackage @"zlib" @pkgs :: Drv "zlib"` and
-`callPackage @"openssl" @pkgs :: Drv "openssl"` are distinct types.
-Swapping them is a compile error:
-
-```haskell
--- Type error: expected Drv "openssl", got Drv "zlib"
-configure :: Drv "openssl" -> Drv "zlib" -> IO ()
-configure openssl zlib = ...
-
+-- Compile error: Derivation "zlib" ≠ Derivation "openssl"
 bad = configure (callPackage @"zlib" @pkgs) (callPackage @"openssl" @pkgs)
---               ^^^^^^^^^^^^^^^^^^^^^^^^^ Drv "zlib" ≠ Drv "openssl"
 ```
 
-The tag is erased when entering `buildInputs` via `toDerivation`:
+The tag is erased when entering `buildInputs` via `toDrv`:
 
 ```haskell
 buildInputs =
-  [ toDerivation $ callPackage @"openssl" @pkgs  -- Drv "openssl" → Derivation
-  , toDerivation $ callPackage @"zlib" @pkgs     -- Drv "zlib"    → Derivation
+  [ toDrv $ callPackage @"openssl" @pkgs  -- Derivation "openssl" → Drv
+  , toDrv $ callPackage @"zlib" @pkgs     -- Derivation "zlib"    → Drv
   ]
 ```
 
-The type hierarchy from most to least specific:
+Two-level type hierarchy:
 
 ```
-Drv "zlib"      -- tagged: provenance known at the type level
-AnyDerivation   -- existential: some HasDerivation, tag erased
-Derivation      -- raw: the .drv the Nix daemon builds
+Derivation "zlib"   -- tagged + existential: provenance known, extra info inside
+Drv                 -- raw: the .drv file the Nix daemon builds
 ```
-
-`Drv name` and `AnyDerivation` serve different roles. `Drv name` is the
-default for normal packages — it prevents accidental swaps in typed
-interfaces. `AnyDerivation` is for heterogeneous collections where the
-concrete package is unknown (e.g., `buildInputs` could be
-`[AnyDerivation]` instead of `[Derivation]`).
-
-Infrastructure overrides `Output` as before:
-
-```haskell
-instance Package "stdenv" where
-  type Output "stdenv" = MkDerivationArgs -> AnyDerivation  -- function, not Drv
-instance Package "fetchurl" where
-  type Output "fetchurl" = Text -> Text -> Derivation       -- function, not Drv
-```
-
-`Pkg` instances also carry the tag naturally — `Pkg "openssl"` already
-witnesses provenance (§11.5), and its `HasDerivation` instance bridges
-to `Derivation` when needed.

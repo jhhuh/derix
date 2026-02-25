@@ -31,28 +31,27 @@ and demand-driven evaluation resolves only what is needed.
 
 ## What's Here
 
-### Formal Calculus ([`doc/calculus.md`](doc/calculus.md))
+### The `callPackage` Encoding ([`doc/callpackage.md`](doc/callpackage.md))
 
-A pen-and-paper resolution calculus where packages are instance declarations,
-dependencies are constraints, and resolution is proof search. Covers:
+The current design. `callPackage` is a class method, `pkgs` is a phantom
+type, dependencies are constraints, and instance resolution IS dependency
+resolution. Core types:
 
-- Syntax (constraints, evidence terms, declarations, thunk states)
-- Inference rules for resolution
-- Call-by-need operational semantics with black-hole cycle detection
-- The package set as a lazy fixed point (Kleene's theorem)
-- Overlays as environment extension (the Nix `final: prev:` pattern)
-- Coherence conditions and selection policies
-- Metatheory: soundness, determinism, termination, fixed-point existence
+- `Drv` — the raw `.drv` store derivation (what the Nix daemon builds)
+- `Derivation name` — existential + phantom-tagged wrapper (carries extra
+  info, prevents accidental swaps at compile time)
+- `Package name` — indexed class with `Deps`, `Output`, and `callPackage`
+- `Has name pkgs` — package set membership witness
 
-### GHC Encoding Design Space ([`doc/encoding.md`](doc/encoding.md))
+### Earlier Exploration (Historical)
 
-How Haskell's type system features map to package management. Each GHC
-extension gets a section exploring its encoding potential:
+- [`doc/calculus.md`](doc/calculus.md) — formal resolution calculus
+  (proof search, lazy fixed points, overlays, coherence)
+- [`doc/encoding.md`](doc/encoding.md) — survey of GHC features for
+  encoding package management (multi-class, GADTs, type families, etc.)
 
-- GHC encodings (multi-class, indexed, hybrid with OverloadedLabels)
-- Superclass context, default methods, DataKinds, bootstrap
-- Associated types, deriving strategies, quantified constraints
-- Backpack, ConstraintKinds, type families, GADTs
+These documents explore the design space but are superseded by
+`callpackage.md` for the concrete encoding.
 
 ### Haskell Prototype ([`src/`](src/))
 
