@@ -14,50 +14,53 @@ The name is a triple pun: Nix **derivation** (build recipe), logical
 **derivation** (proof tree), Haskell **deriving** (automatic instance
 generation) — all the same object, in the N**ix** ecosystem.
 
-## The Correspondence
+## The Encoding
 
+The current design is in [`doc/callpackage.md`](doc/callpackage.md).
+
+`callPackage` is a class method. `pkgs` is a phantom type. Dependencies
+are constraints. Instance resolution IS dependency resolution.
+
+```haskell
+class Package (name :: Symbol) where
+  type Deps name (pkgs :: Type) :: Constraint
+  type Output name :: Type
+  type Output name = Derivation name
+  callPackage :: forall pkgs -> Deps name pkgs => Output name
 ```
-Typeclass World                    Package World
-─────────────────────────────────  ─────────────────────────────────
-instance (Eq a) => Ord a           openssl@3.1 depends on zlib≥1.0
-Instance resolution (proof search) Dependency resolution
-Dictionary (evidence term)         Derivation (build plan)
-Coherence (one instance per type)  One version per package
-The dictionary environment         The package set (nixpkgs)
-```
 
-The key shared property: both environments are defined as a **lazy fixed point**,
-and demand-driven evaluation resolves only what is needed.
-
-## What's Here
-
-### The `callPackage` Encoding ([`doc/callpackage.md`](doc/callpackage.md))
-
-The current design. `callPackage` is a class method, `pkgs` is a phantom
-type, dependencies are constraints, and instance resolution IS dependency
-resolution. Core types:
+Core types:
 
 - `Drv` — the raw `.drv` store derivation (what the Nix daemon builds)
-- `Derivation name` — existential + phantom-tagged wrapper (carries extra
-  info, prevents accidental swaps at compile time)
-- `Package name` — indexed class with `Deps`, `Output`, and `callPackage`
+- `Derivation name` — existential + phantom-tagged wrapper (carries
+  extra info, prevents accidental swaps at compile time)
 - `Has name pkgs` — package set membership witness
+- `HasDrv` — class bridging rich types to raw `Drv`
 
-### Earlier Exploration (Historical)
+```
+Nix                              Haskell
+────────────────────────────────  ────────────────────────────────
+{ stdenv, zlib }:                type Deps "openssl" pkgs =
+  stdenv.mkDerivation { ... }      (Has "stdenv" pkgs, Has "zlib" pkgs)
+callPackage ./openssl.nix {}     callPackage @"openssl" @Nixpkgs
+pkgs.stdenv.mkDerivation         callPackage @"stdenv" @Nixpkgs
+  (a function in pkgs)             :: MkDerivationArgs -> Drv
+missing argument error           No instance for Has "foo" Nixpkgs
+  (at eval time)                   (at compile time)
+```
+
+## Background
 
 - [`doc/calculus.md`](doc/calculus.md) — formal resolution calculus
-  (proof search, lazy fixed points, overlays, coherence)
-- [`doc/encoding.md`](doc/encoding.md) — survey of GHC features for
-  encoding package management (multi-class, GADTs, type families, etc.)
+  (syntax, inference rules, call-by-need semantics, lazy fixed points,
+  overlays, coherence, metatheory)
+- [`doc/encoding.md`](doc/encoding.md) — survey of GHC features mapped
+  to package management concepts
 
-These documents explore the design space but are superseded by
-`callpackage.md` for the concrete encoding.
+## Prototype
 
-### Haskell Prototype ([`src/`](src/))
-
-A working implementation demonstrating that **Haskell's laziness IS the
-calculus's operational semantics**. No `IORef`, no explicit thunk management.
-A recursive `let` is the fixed point:
+The Haskell prototype in [`src/`](src/) demonstrates that **Haskell's
+laziness IS the calculus's operational semantics**:
 
 ```haskell
 buildPkgSet env =
@@ -69,34 +72,8 @@ buildPkgSet env =
   in pkgSet
 ```
 
-`pkgSet` references itself — that's the `fix`. GHC's runtime provides sharing
-(each package resolved at most once), black-hole detection (cycles produce
-`<<loop>>`), and demand-driven evaluation (unneeded packages stay as thunks).
-
-#### Example Output
-
-```
-instance () => zlib@1.3.0
-instance zlib@≥1.0.0 => openssl@3.1.0
-instance (openssl@≥3.0.0, zlib@≥1.2.0) => python@3.12.0
-
-Forcing python:
-python@3.12.0
-  openssl@3.1.0
-    zlib@1.3.0
-  zlib@1.3.0
-```
-
-The prototype demonstrates:
-- **Sharing**: `zlib` resolved once, reused by `openssl` and `python`
-- **Laziness**: undemanded packages (`curl`) never resolved
-- **Diamond coherence**: `text from parsec == text from aeson: True`
-- **Overlay cascade**: bump `openssl` and `python` picks it up automatically
-- **Cycle detection**: circular dependencies caught statically
-
-## Building
-
-Requires [Nix](https://nixos.org/) with flakes enabled:
+`pkgSet` references itself — that's the `fix`. GHC's runtime provides
+sharing, black-hole detection (`<<loop>>`), and demand-driven evaluation.
 
 ```sh
 nix develop -c cabal run derix
@@ -104,11 +81,9 @@ nix develop -c cabal run derix
 
 ## Status
 
-**Actively exploring the design space.** Nothing here is settled. The formal
-calculus document (`doc/calculus.md`) is a living sketchbook — sections may
-contradict each other as we explore different encodings and GHC features.
-The Haskell prototype in `src/` demonstrates the core lazy-fixed-point idea
-but does not track the document's evolving design.
+**Actively exploring the design space.** The prototype in `src/`
+demonstrates the core lazy-fixed-point idea but does not track the
+documents' evolving design.
 
 ## License
 
