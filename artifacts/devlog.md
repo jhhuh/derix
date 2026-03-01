@@ -169,3 +169,68 @@ Kept only the essential formal content.
 and Haskell build deps from `flake.nix`. GHC's typeclass machinery IS the
 resolver — a separate implementation is the wrong approach. The project is
 design documents only.
+
+## 2026-03-01 — Overlays and override patterns (doc/overlay.md)
+
+**Overlay encoding designed**: `doc/overlay.md` created. Index `Package` by
+both `name :: Symbol` and `pkgs :: Type`. Overlays are phantom types
+(`data MyOverlay pkgs`) with `OVERLAPPABLE` inheritance for `Has` and `Package`.
+Non-overridden packages fall through to the base; overridden packages get
+`OVERLAPPING` instances. Type nesting (`Overlay2 (Overlay1 Nixpkgs)`) = stacking.
+
+**`final:` and `prev:`**: In `Package "x" (MyOverlay pkgs)`, the overlay type
+(`MyOverlay pkgs`) is `final:` — deps resolve against it. The wrapped `pkgs` is
+`prev:` — the overlay can reach back to the base recipe.
+
+**Bootstrap stages**: Mapped Nixpkgs/Guix bootstrap (Seed → Stage1 → Stage2 →
+Final) to overlay stacking. Each stage overrides key packages (gcc, glibc, stdenv),
+everything else inherits via `OVERLAPPABLE`. The type records full provenance.
+
+**Backpack for composition**: Overlay composition via Cabal `mixins` with `as`.
+Each overlay is a Cabal component with a `requires BasePkgs` signature. Provides
+separate compilation — overlays compile against signatures, wiring at link time.
+
+**Override patterns — extensive exploration → convergence**:
+
+Explored 7+ approaches to encoding Nix's `makeOverridable` in Haskell:
+explicit wrapper, implicit params, reflection, ReaderT, Backpack, extensible
+records (vinyl/row-types), `HasField`, `dependent-map`. User rejected value-level
+approaches (DMap) in favor of staying type-level.
+
+**Key insight**: Recipe (the `.nix` file) and `callPackage` (auto-wiring) are
+separate concerns. `recipe` is a class method — the build logic. `callPackage`
+is derived — resolve deps + apply recipe + seal in existential `Derivation`.
+
+**Existential constraint**: Override must happen BEFORE `callPackage` seals the
+result in `Derivation name = forall a. HasDrv a => Derivation a`. Once sealed,
+the inner type is unknown and can't be modified.
+
+**Final override design — `Overridable` + `withDict`**:
+
+Since `Overridable` is a single-method class (`func -> func`), its dictionary
+IS a function pointer. `withDict` (GHC 9.4) installs arbitrary functions as
+dictionaries at runtime. This gives dynamic, composable overrides:
+
+```haskell
+class Overridable func where
+  mkOverridable :: func -> func    -- default: id (blanket instance)
+
+override :: (func -> func) -> (Overridable func => r) -> (Overridable func => r)
+override advice body =
+  let composedAdvice = mkOverridable . advice   -- existing wraps new
+  in override0 composedAdvice body              -- override0 = withDict
+```
+
+Composition order `mkOverridable . advice`: new advice applied first, then
+existing override wraps it. Chaining `override a2 $ override a1 $ body` gives
+`a2 (a1 recipe)` — outer overrides wrap inner ones. Matches Emacs `:around`
+advice semantics.
+
+**Emacs advice analogy**: Override is `advice-add` with `:around`. `:filter-args`
+= pre-compose, `:filter-return` = post-compose, `:around` = full control.
+`:around` subsumes the others — just higher-order functions.
+
+**Overlay.md rewritten**: Replaced the 570-line §4 (7 exploratory options) with
+157-line §4 (single converged design). Sections: Recipe vs callPackage, Overridable
+class, withDict magic, composable override, Emacs advice analogy, interaction with
+overlays.

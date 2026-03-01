@@ -400,8 +400,9 @@ Multiple outputs and typed interfaces need a richer `Output` type
 
 **Overlays require separate design.** With one class and `Symbol`
 indexing, you cannot have two `Package "openssl"` instances (different
-versions). Overlays need a different mechanism — perhaps a `pkgs`-indexed
-version of `Package`, or a separate overlay algebra.
+versions). See [`overlay.md`](overlay.md) for the solution: index
+`Package` by both `name` and `pkgs`, with `OVERLAPPABLE` inheritance
+and Cabal Backpack for overlay composition.
 
 These are acknowledged trade-offs. This document focuses on the
 `callPackage` core; extensions can recover the lost features.
